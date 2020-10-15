@@ -5,6 +5,7 @@ use tokio::stream::StreamExt;
 
 use etcd_rs::*;
 
+#[allow(dead_code)]
 async fn grant_lease(client: &Client) -> Result<()> {
     println!("grant lease");
 
@@ -67,17 +68,21 @@ async fn keep_alive_lease(client: &Client) -> Result<()> {
         // watch keep alive event
         let mut inbound = client.lease().keep_alive_responses().await;
         tokio::spawn(async move {
-            loop {
-                match inbound.next().await {
-                    Some(resp) => {
-                        println!("=====>");
-                        println!("keep alive response: {:?}", resp);
-                    }
-                    None => {
-                        break;
-                    }
-                }
+            while let Some(resp) = inbound.next().await {
+                println!("=====>");
+                println!("keep alive response: {:?}", resp);
             }
+            // loop {
+            //     match inbound.next().await {
+            //         Some(resp) => {
+            //             println!("=====>");
+            //             println!("keep alive response: {:?}", resp);
+            //         }
+            //         None => {
+            //             break;
+            //         }
+            //     }
+            // }
         });
     }
 
@@ -103,11 +108,11 @@ async fn keep_alive_lease(client: &Client) -> Result<()> {
             client
                 .lease()
                 .keep_alive(LeaseKeepAliveRequest::new(lease_id))
-                .await;
+                .await?;
         }
     }
 
-    Ok(())
+    // Ok(())
 }
 
 #[tokio::main]

@@ -176,7 +176,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::default());
 
         let lazy = {
-            let calls = calls.clone();
+            let calls = Arc::clone(&calls);
             Lazy::new(move || {
                 calls.fetch_add(1, ORDER);
                 true
@@ -203,7 +203,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::default());
 
         let lazy = {
-            let calls = calls.clone();
+            let calls = Arc::clone(&calls);
             Lazy::new(move || {
                 calls.fetch_add(1, ORDER);
                 true
@@ -243,12 +243,12 @@ mod tests {
         }
 
         let lazy = {
-            let shutdown_calls = shutdown_calls.clone();
-            let init_calls = init_calls.clone();
+            let shutdown_calls = Arc::clone(&shutdown_calls);
+            let init_calls = Arc::clone(&init_calls);
             Lazy::new(move || {
                 init_calls.fetch_add(1, ORDER);
                 Test {
-                    shutdown: shutdown_calls.clone(),
+                    shutdown: Arc::clone(&shutdown_calls),
                 }
             })
         };
