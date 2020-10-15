@@ -53,7 +53,7 @@ use tokio::sync::{
 };
 use tonic::transport::Channel;
 
-pub use watch::{WatchRequest, WatchResponse};
+pub use watch_impl::{WatchRequest, WatchResponse};
 
 use crate::lazy::{Lazy, Shutdown};
 use crate::proto::etcdserverpb;
@@ -63,7 +63,7 @@ use crate::KeyValue;
 use crate::Result;
 use crate::{Error, KeyRange};
 
-mod watch;
+mod watch_impl;
 
 /// WatchTunnel is a reusable connection for `Watch` operation
 /// The underlying gRPC method is Bi-directional streaming
