@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::stream::Stream;
+use smol::stream::Stream;
 use tonic::transport::ClientTlsConfig;
 use tonic::{metadata::MetadataValue, transport::Channel, Interceptor, Request};
 

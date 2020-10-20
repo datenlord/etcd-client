@@ -6,21 +6,31 @@ on:
   schedule: [cron: "0 0 * * *"]
 
 env:
-  CARGO_TERM_COLOR: always
+  CI_RUST_TOOLCHAIN: 1.47.0
 
 jobs:
   test:
-    name: Rust ${{matrix.rust}}
+    name: Cargo test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [nightly, beta, stable]
     steps:
+      - name: Prepare docker environment
+        uses: crazy-max/ghaction-docker-buildx@v3
+        with:
+          buildx-version: latest
+          qemu-version: latest
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: ${{matrix.rust}}
+          profile: default
+          toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
+          override: true
+      - name: Run etcd service
+        run: |
+          export ETCD_CONTAINER_NAME=etcd
+          docker run -d --rm --net host --name $ETCD_CONTAINER_NAME gcr.io/etcd-development/etcd:latest
+          docker ps
+          docker logs $ETCD_CONTAINER_NAME
+          sudo netstat -lntp
       - run: cargo test
       - run: cargo check --no-default-features
 

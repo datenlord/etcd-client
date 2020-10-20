@@ -2,7 +2,7 @@
 use std::ops::{Deref, DerefMut};
 
 use async_trait::async_trait;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use smol::lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::Result;
 
@@ -171,125 +171,136 @@ mod tests {
     const ORDER: Ordering = Ordering::SeqCst;
 
     /// Test getting a read lock from a `Lazy`.
-    #[tokio::test]
-    async fn test_lock_read() {
-        let calls = Arc::new(AtomicUsize::default());
+    #[test]
+    fn test_lock_read() {
+        smol::block_on(async {
+            let calls = Arc::new(AtomicUsize::default());
 
-        let lazy = {
-            let calls = Arc::clone(&calls);
-            Lazy::new(move || {
-                calls.fetch_add(1, ORDER);
-                true
-            })
-        };
-        assert_eq!(calls.load(ORDER), 0, "Expected thunk not called.");
+            let lazy = {
+                let calls = Arc::clone(&calls);
+                Lazy::new(move || {
+                    calls.fetch_add(1, ORDER);
+                    true
+                })
+            };
+            assert_eq!(calls.load(ORDER), 0, "Expected thunk not called.");
 
-        let lock = lazy.read().await;
-        assert_eq!((*lock), true, "Expected read() == thunk().");
-        assert_eq!(calls.load(ORDER), 1, "Expected thunk called *once*.");
+            let lock = lazy.read().await;
+            assert_eq!((*lock), true, "Expected read() == thunk().");
+            assert_eq!(calls.load(ORDER), 1, "Expected thunk called *once*.");
 
-        // Should be able to acquire many read permits at once
-        let lock2 = lazy.read().await;
-        assert!(
-            ptr::eq(&(*lock), &(*lock2)),
-            "Expected read() to give *same reference*."
-        );
-        assert_eq!(calls.load(ORDER), 1, "Expected thunk *still* called once.");
+            // Should be able to acquire many read permits at once
+            let lock2 = lazy.read().await;
+            assert!(
+                ptr::eq(&(*lock), &(*lock2)),
+                "Expected read() to give *same reference*."
+            );
+            assert_eq!(calls.load(ORDER), 1, "Expected thunk *still* called once.");
+        });
     }
 
     /// Test getting a write lock from a `Lazy`.
-    #[tokio::test]
-    async fn test_lock_write() {
-        let calls = Arc::new(AtomicUsize::default());
+    #[test]
+    fn test_lock_write() {
+        smol::block_on(async {
+            let calls = Arc::new(AtomicUsize::default());
 
-        let lazy = {
-            let calls = Arc::clone(&calls);
-            Lazy::new(move || {
-                calls.fetch_add(1, ORDER);
-                true
-            })
-        };
-        assert_eq!(calls.load(ORDER), 0, "Expected thunk not called.");
+            let lazy = {
+                let calls = Arc::clone(&calls);
+                Lazy::new(move || {
+                    calls.fetch_add(1, ORDER);
+                    true
+                })
+            };
+            assert_eq!(calls.load(ORDER), 0, "Expected thunk not called.");
 
-        {
-            // need to let the write lock go out of scope before we can read
-            let mut lock = lazy.write().await;
-            assert_eq!((*lock), true, "Expected write() == thunk().");
-            assert_eq!(calls.load(ORDER), 1, "Expected thunk called *once*.");
+            {
+                // need to let the write lock go out of scope before we can read
+                let mut lock = lazy.write().await;
+                assert_eq!((*lock), true, "Expected write() == thunk().");
+                assert_eq!(calls.load(ORDER), 1, "Expected thunk called *once*.");
 
-            *lock = false;
-        }
+                *lock = false;
+            }
 
-        let lock = lazy.read().await;
-        assert_eq!(calls.load(ORDER), 1, "Expected thunk *still* called once.");
-        assert_eq!(*lock, false, "Expected read() to have been changed.");
+            let lock = lazy.read().await;
+            assert_eq!(calls.load(ORDER), 1, "Expected thunk *still* called once.");
+            assert_eq!(*lock, false, "Expected read() to have been changed.");
+        });
     }
 
-    #[tokio::test]
-    async fn test_lock_evict() {
-        let init_calls = Arc::new(AtomicUsize::default());
-        let shutdown_calls = Arc::new(AtomicUsize::default());
+    #[test]
+    fn test_lock_evict() {
+        smol::block_on(async {
+            let init_calls = Arc::new(AtomicUsize::default());
+            let shutdown_calls = Arc::new(AtomicUsize::default());
 
-        struct Test {
-            shutdown: Arc<AtomicUsize>,
-        };
+            struct Test {
+                shutdown: Arc<AtomicUsize>,
+            };
 
-        #[async_trait]
-        impl Shutdown for Test {
-            async fn shutdown(&mut self) -> Result<()> {
-                self.shutdown.fetch_add(1, ORDER);
-                Ok(())
-            }
-        }
-
-        let lazy = {
-            let shutdown_calls = Arc::clone(&shutdown_calls);
-            let init_calls = Arc::clone(&init_calls);
-            Lazy::new(move || {
-                init_calls.fetch_add(1, ORDER);
-                Test {
-                    shutdown: Arc::clone(&shutdown_calls),
+            #[async_trait]
+            impl Shutdown for Test {
+                async fn shutdown(&mut self) -> Result<()> {
+                    self.shutdown.fetch_add(1, ORDER);
+                    Ok(())
                 }
-            })
-        };
-        assert_eq!(init_calls.load(ORDER), 0, "Expected init not called.");
-        assert_eq!(
-            shutdown_calls.load(ORDER),
-            0,
-            "Expected shutdown not called."
-        );
+            }
 
-        {
-            let lock = lazy.read().await;
-            let _: Test = *lock;
-            assert_eq!(init_calls.load(ORDER), 1, "Expected init called once.");
+            let lazy = {
+                let shutdown_calls = Arc::clone(&shutdown_calls);
+                let init_calls = Arc::clone(&init_calls);
+                Lazy::new(move || {
+                    init_calls.fetch_add(1, ORDER);
+                    Test {
+                        shutdown: Arc::clone(&shutdown_calls),
+                    }
+                })
+            };
+            assert_eq!(init_calls.load(ORDER), 0, "Expected init not called.");
             assert_eq!(
                 shutdown_calls.load(ORDER),
                 0,
                 "Expected shutdown not called."
             );
-        }
 
-        lazy.evict().await.expect("eviction should not fail");
+            {
+                let lock = lazy.read().await;
+                let _: Test = *lock;
+                assert_eq!(init_calls.load(ORDER), 1, "Expected init called once.");
+                assert_eq!(
+                    shutdown_calls.load(ORDER),
+                    0,
+                    "Expected shutdown not called."
+                );
+            }
 
-        {
-            let lock = lazy.read().await;
-            let _: Test = *lock;
-            assert_eq!(init_calls.load(ORDER), 2, "Expected init called twice.");
+            lazy.evict().await.expect("eviction should not fail");
+
+            {
+                let lock = lazy.read().await;
+                let _: Test = *lock;
+                assert_eq!(init_calls.load(ORDER), 2, "Expected init called twice.");
+                assert_eq!(
+                    shutdown_calls.load(ORDER),
+                    1,
+                    "Expected shutdown called once."
+                );
+            }
+
+            // Two evictions in a row
+            lazy.evict().await.expect("eviction should not fail");
             assert_eq!(
                 shutdown_calls.load(ORDER),
-                1,
-                "Expected shutdown called once."
+                2,
+                "Expected shutdown called twice."
             );
-        }
-
-        // Two evictions in a row
-        lazy.evict().await.expect("eviction should not fail");
-        lazy.evict().await.expect("eviction should not fail"); // should be a no-op
-        assert_eq!(
-            init_calls.load(ORDER),
-            2,
-            "Expected init *still* called twice."
-        );
+            lazy.evict().await.expect("eviction should not fail"); // should be a no-op
+            assert_eq!(
+                init_calls.load(ORDER),
+                2,
+                "Expected init *still* called twice."
+            );
+        });
     }
 }
