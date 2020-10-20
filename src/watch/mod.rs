@@ -1,56 +1,13 @@
 //! The Watch API provides an event-based interface for asynchronously monitoring changes to keys.
-//!
-//! # Examples
-//!
-//! Watch key `foo` changes
-//!
-//! ```no_run
-//! use tokio::stream::StreamExt;
-//!
-//! use etcd_rs::*;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<()> {
-//!     let client = Client::connect(ClientConfig {
-//!         endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-//!         auth: None,
-//!         tls: None,
-//!     }).await?;
-//!
-//!     // print out all received watch responses
-//!     let mut inbound = client.watch(KeyRange::key("foo")).await;
-//!     tokio::spawn(async move {
-//!         while let Some(resp) = inbound.next().await {
-//!             println!("watch response: {:?}", resp);
-//!         }
-//!     });
-//!
-//!     let key = "foo";
-//!     client.kv().put(PutRequest::new(key, "bar")).await?;
-//!     client.kv().put(PutRequest::new(key, "baz")).await?;
-//!     client
-//!         .kv()
-//!         .delete(DeleteRequest::new(KeyRange::key(key)))
-//!         .await?;
-//!
-//!     // not necessary, but will cleanly shut down the long-running tasks
-//!     // spawned by the client
-//!     client.shutdown().await;
-//!
-//!     Ok(())
-//! }
-//!
-//! ```
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::FutureExt;
-use tokio::stream::Stream;
-use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    oneshot,
-};
+
+use futures::stream::StreamExt;
+use smol::channel::{unbounded, Receiver, Sender};
+use smol::stream::Stream;
 use tonic::transport::Channel;
 
 pub use watch_impl::{WatchRequest, WatchResponse};
@@ -68,28 +25,28 @@ mod watch_impl;
 /// WatchTunnel is a reusable connection for `Watch` operation
 /// The underlying gRPC method is Bi-directional streaming
 struct WatchTunnel {
-    req_sender: UnboundedSender<WatchRequest>,
-    resp_receiver: Option<UnboundedReceiver<Result<WatchResponse>>>,
-    shutdown: Option<oneshot::Sender<()>>,
+    req_sender: Sender<WatchRequest>,
+    resp_receiver: Option<Receiver<Result<WatchResponse>>>,
+    shutdown: Option<Sender<()>>,
 }
 
 impl WatchTunnel {
     fn new(mut client: WatchClient<Channel>) -> Self {
-        let (req_sender, mut req_receiver) = unbounded_channel::<WatchRequest>();
-        let (resp_sender, resp_receiver) = unbounded_channel::<Result<WatchResponse>>();
+        let (req_sender, req_receiver) = unbounded::<WatchRequest>();
+        let (resp_sender, resp_receiver) = unbounded::<Result<WatchResponse>>();
 
         let request = tonic::Request::new(async_stream::stream! {
-            while let Some(req) = req_receiver.recv().await {
+            while let Ok(req) = req_receiver.recv().await {
                 let pb: etcdserverpb::WatchRequest = req.into();
                 yield pb;
             }
         });
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = unbounded();
 
         // monitor inbound watch response and transfer to the receiver
-        tokio::spawn(async move {
-            let mut shutdown_rx = shutdown_rx.fuse();
+        smol::spawn(async move {
+            let mut shutdown_rx = shutdown_rx.into_future().fuse();
             let mut inbound = futures::select! {
                 res = client.watch(request).fuse() => res.unwrap().into_inner(),
                 _ = shutdown_rx => { return; },
@@ -102,17 +59,18 @@ impl WatchTunnel {
                 };
                 match resp {
                     Ok(Some(resp)) => {
-                        resp_sender.send(Ok(From::from(resp))).unwrap();
+                        resp_sender.send(Ok(From::from(resp))).await.unwrap();
                     }
                     Ok(None) => {
                         return;
                     }
                     Err(e) => {
-                        resp_sender.send(Err(From::from(e))).unwrap();
+                        resp_sender.send(Err(From::from(e))).await.unwrap();
                     }
                 };
             }
-        });
+        })
+        .detach();
 
         Self {
             req_sender,
@@ -121,7 +79,7 @@ impl WatchTunnel {
         }
     }
 
-    fn take_resp_receiver(&mut self) -> UnboundedReceiver<Result<WatchResponse>> {
+    fn take_resp_receiver(&mut self) -> Receiver<Result<WatchResponse>> {
         self.resp_receiver.take().unwrap()
     }
 }
@@ -130,7 +88,7 @@ impl WatchTunnel {
 impl Shutdown for WatchTunnel {
     async fn shutdown(&mut self) -> Result<()> {
         if let Some(shutdown) = self.shutdown.take() {
-            shutdown.send(()).map_err(|_| Error::ChannelClosed)?;
+            shutdown.send(()).await.map_err(|_| Error::ChannelClosed)?;
         }
         Ok(())
     }
@@ -162,6 +120,7 @@ impl Watch {
         tunnel
             .req_sender
             .send(WatchRequest::create(key_range))
+            .await
             .expect("emit watch request");
         tunnel.take_resp_receiver()
     }

@@ -1,75 +1,13 @@
 //! Leases are a mechanism for detecting client liveness. The cluster grants leases with a time-to-live. A lease expires if the etcd cluster does not receive a keepAlive within a given TTL period.
-//!
-//! # Examples
-//!
-//! Grant lease and keep lease alive
-//!
-//! ```no_run
-//! use std::time::Duration;
-//!
-//! use etcd_rs::*;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<()> {
-//!     let client = Client::connect(ClientConfig {
-//!         endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-//!         auth: None,
-//!         tls: None,
-//!     }).await?;
-//!
-//!     let key = "foo";
-//!
-//!     // grant lease
-//!     let lease = client
-//!         .lease()
-//!         .grant(LeaseGrantRequest::new(Duration::from_secs(3)))
-//!         .await?;
-//!
-//!     let lease_id = lease.id();
-//!
-//!     // set key with lease
-//!     client
-//!         .kv()
-//!         .put({
-//!             let mut req = PutRequest::new(key, "bar");
-//!             req.set_lease(lease_id);
-//!
-//!             req
-//!         })
-//!         .await?;
-//!
-//!     {
-//!         // keep alive the lease every 1 second
-//!         let client = client.clone();
-//!
-//!         let mut interval = tokio::time::interval(Duration::from_secs(1));
-//!
-//!         loop {
-//!             interval.tick().await;
-//!             client
-//!                 .lease()
-//!                 .keep_alive(LeaseKeepAliveRequest::new(lease_id))
-//!                 .await;
-//!         }
-//!     }
-//!
-//!     // not necessary, but will cleanly shut down the long-running tasks
-//!     // spawned by the client
-//!     client.shutdown().await;
-//!
-//!     Ok(())
-//! }
-//! ```
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::FutureExt;
-use tokio::stream::Stream;
-use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    oneshot,
-};
+use futures::stream::StreamExt;
+
+use smol::channel::{unbounded, Receiver, Sender};
+use smol::stream::Stream;
 use tonic::transport::Channel;
 
 pub use grant::{LeaseGrantRequest, LeaseGrantResponse};
@@ -88,28 +26,28 @@ mod revoke;
 /// LeaseKeepAliveTunnel is a reusable connection for `Lease Keep Alive` operation.
 /// The underlying gRPC method is Bi-directional streaming.
 struct LeaseKeepAliveTunnel {
-    req_sender: UnboundedSender<LeaseKeepAliveRequest>,
-    resp_receiver: Option<UnboundedReceiver<Result<LeaseKeepAliveResponse>>>,
-    shutdown: Option<oneshot::Sender<()>>,
+    req_sender: Sender<LeaseKeepAliveRequest>,
+    resp_receiver: Option<Receiver<Result<LeaseKeepAliveResponse>>>,
+    shutdown: Option<Sender<()>>,
 }
 
 impl LeaseKeepAliveTunnel {
     fn new(mut client: LeaseClient<Channel>) -> Self {
-        let (req_sender, mut req_receiver) = unbounded_channel::<LeaseKeepAliveRequest>();
-        let (resp_sender, resp_receiver) = unbounded_channel::<Result<LeaseKeepAliveResponse>>();
+        let (req_sender, req_receiver) = unbounded::<LeaseKeepAliveRequest>();
+        let (resp_sender, resp_receiver) = unbounded::<Result<LeaseKeepAliveResponse>>();
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = unbounded();
 
         let request = tonic::Request::new(async_stream::stream! {
-            while let Some(req) = req_receiver.recv().await {
+            while let Ok(req) = req_receiver.recv().await {
                 let pb: etcdserverpb::LeaseKeepAliveRequest = req.into();
                 yield pb;
             }
         });
 
         // monitor inbound watch response and transfer to the receiver
-        tokio::spawn(async move {
-            let mut shutdown_rx = shutdown_rx.fuse();
+        smol::spawn(async move {
+            let mut shutdown_rx = shutdown_rx.into_future().fuse();
             let mut inbound = futures::select! {
                 res = client.lease_keep_alive(request).fuse() => res.unwrap().into_inner(),
                 _ = shutdown_rx => { return; }
@@ -122,17 +60,18 @@ impl LeaseKeepAliveTunnel {
                 };
                 match resp {
                     Ok(Some(resp)) => {
-                        resp_sender.send(Ok(From::from(resp))).unwrap();
+                        resp_sender.send(Ok(From::from(resp))).await.unwrap();
                     }
                     Ok(None) => {
                         return;
                     }
                     Err(e) => {
-                        resp_sender.send(Err(From::from(e))).unwrap();
+                        resp_sender.send(Err(From::from(e))).await.unwrap();
                     }
                 };
             }
-        });
+        })
+        .detach();
 
         Self {
             req_sender,
@@ -141,7 +80,7 @@ impl LeaseKeepAliveTunnel {
         }
     }
 
-    fn take_resp_receiver(&mut self) -> UnboundedReceiver<Result<LeaseKeepAliveResponse>> {
+    fn take_resp_receiver(&mut self) -> Receiver<Result<LeaseKeepAliveResponse>> {
         self.resp_receiver.take().unwrap()
     }
 }
@@ -150,7 +89,7 @@ impl LeaseKeepAliveTunnel {
 impl Shutdown for LeaseKeepAliveTunnel {
     async fn shutdown(&mut self) -> Result<()> {
         if let Some(shutdown) = self.shutdown.take() {
-            shutdown.send(()).map_err(|_| Error::ChannelClosed)?;
+            shutdown.send(()).await.map_err(|_| Error::ChannelClosed)?;
         }
         Ok(())
     }
@@ -209,6 +148,7 @@ impl Lease {
             .await
             .req_sender
             .send(req)
+            .await
             .map_err(|_| Error::ChannelClosed)
     }
 

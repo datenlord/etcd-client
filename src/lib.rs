@@ -1,47 +1,6 @@
 //! An asynchronously etcd client for Rust.
 //!
-//! etcd-rs supports etcd v3 API and async/await syntax.
-//!
-//! # Examples
-//!
-//! A simple key-value read and write operation:
-//!
-//! ```no_run
-//! use etcd_rs::*;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<()> {
-//!     let client = Client::connect(ClientConfig {
-//!         endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-//!         auth: None,
-//!         tls: None,
-//!     }).await?;
-//!
-//!     let key = "foo";
-//!     let value = "bar";
-//!
-//!     // Put a key-value pair
-//!     let resp = client.kv().put(PutRequest::new(key, value)).await?;
-//!
-//!     println!("Put Response: {:?}", resp);
-//!
-//!     // Get the key-value pair
-//!     let resp = client
-//!         .kv()
-//!         .range(RangeRequest::new(KeyRange::key(key)))
-//!         .await?;
-//!     println!("Range Response: {:?}", resp);
-//!
-//!     // Delete the key-valeu pair
-//!     let resp = client
-//!         .kv()
-//!         .delete(DeleteRequest::new(KeyRange::key(key)))
-//!         .await?;
-//!     println!("Delete Response: {:?}", resp);
-//!
-//!    Ok(())
-//! }
-//! ```
+//! etcd-client supports etcd v3 API and async/await syntax.
 
 #![deny(
     // The following are allowed by default lints according to
@@ -111,3 +70,76 @@ mod response_header;
 mod watch;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use async_compat::Compat;
+    use std::collections::HashMap;
+
+    const DEFAULT_ETCD_ENDPOINT_FOR_TEST: &str = "http://127.0.0.1:2379";
+
+    #[test]
+    fn test_all() -> anyhow::Result<()> {
+        smol::block_on(Compat::new(async {
+            test_kv().await.context("test etcd kv operations")?;
+            Ok::<(), anyhow::Error>(())
+        }))?;
+        Ok(())
+    }
+
+    async fn test_kv() -> anyhow::Result<()> {
+        let client = build_etcd_client().await?;
+        test_list_prefix(&client).await?;
+        Ok(())
+    }
+
+    async fn test_list_prefix(client: &Client) -> anyhow::Result<()> {
+        let prefix = "42_";
+        // Add test data to etcd
+        let mut test_data = HashMap::new();
+        test_data.insert("41_foo1", "baz1");
+        test_data.insert("42_foo1", "baz1");
+        test_data.insert("42_foo2", "baz2");
+        test_data.insert("42_bar1", "baz3");
+        test_data.insert("42_bar2", "baz4");
+
+        for (key, value) in test_data.clone() {
+            client.kv().put(PutRequest::new(key, value)).await?;
+        }
+
+        // List key-value pairs with prefix
+        let req = RangeRequest::new(KeyRange::prefix(prefix));
+        let mut resp = client.kv().range(req).await?;
+
+        for kv in resp.take_kvs() {
+            assert!(
+                test_data.contains_key(kv.key_str()),
+                "Data fetched from etcd should not exist",
+            );
+            assert_eq!(
+                test_data.get(kv.key_str()),
+                Some(&kv.value_str()),
+                "Fetched wrong value from etcd server"
+            );
+        }
+
+        // Delete key-valeu pairs with prefix
+        let req = DeleteRequest::new(KeyRange::prefix(prefix));
+        let resp = client.kv().delete(req).await?;
+        println!("Delete Response: {:?}", resp);
+
+        Ok(())
+    }
+
+    async fn build_etcd_client() -> anyhow::Result<Client> {
+        let client = Client::connect(ClientConfig {
+            endpoints: vec![DEFAULT_ETCD_ENDPOINT_FOR_TEST.to_owned()],
+            auth: None,
+            tls: None,
+        })
+        .await?;
+        Ok(client)
+    }
+}
