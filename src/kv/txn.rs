@@ -1,89 +1,109 @@
 use super::{
-    DeleteRequest, DeleteResponse, KeyRange, PutRequest, PutResponse, RangeRequest, RangeResponse,
+    EtcdDeleteRequest, EtcdDeleteResponse, EtcdPutRequest, EtcdPutResponse, EtcdRangeRequest,
+    EtcdRangeResponse, KeyRange,
 };
-use crate::proto::etcdserverpb;
+use crate::protos::rpc::{
+    Compare, Compare_CompareResult, Compare_CompareTarget, Compare_oneof_target_union, RequestOp,
+    ResponseOp, ResponseOp_oneof_response, TxnRequest, TxnResponse,
+};
 use crate::ResponseHeader;
-use etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
-use etcdserverpb::Compare;
+use protobuf::RepeatedField;
+use utilities::Cast;
 
 /// Request for performing transaction operations.
-pub struct TxnRequest {
-    proto: etcdserverpb::TxnRequest,
+pub struct EtcdTxnRequest {
+    /// Etcd transaction operations request.
+    proto: TxnRequest,
 }
 
-impl TxnRequest {
-    /// Creates a new TxnRequest.
+impl EtcdTxnRequest {
+    /// Creates a new `TxnRequest`.
+    #[inline]
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            proto: etcdserverpb::TxnRequest {
-                compare: vec![],
-                success: vec![],
-                failure: vec![],
-            },
-        }
+        let txn_request = TxnRequest {
+            compare: RepeatedField::from_vec(vec![]),
+            success: RepeatedField::from_vec(vec![]),
+            failure: RepeatedField::from_vec(vec![]),
+            ..TxnRequest::default()
+        };
+        Self { proto: txn_request }
     }
 
     /// Adds a version compare.
+    #[inline]
     pub fn when_version(mut self, key_range: KeyRange, cmp: TxnCmp, version: usize) -> Self {
-        let result: CompareResult = cmp.into();
-        self.proto.compare.push(Compare {
-            result: result as i32,
-            target: CompareTarget::Version as i32,
+        let compare_result: Compare_CompareResult = cmp.into();
+        let compare = Compare {
+            result: compare_result,
+            target: Compare_CompareTarget::VERSION,
             key: key_range.key,
             range_end: key_range.range_end,
-            target_union: Some(TargetUnion::Version(version as i64)),
-        });
+            target_union: Some(Compare_oneof_target_union::version(version.cast())),
+            ..Compare::default()
+        };
+        self.proto.compare.push(compare);
         self
     }
 
     /// Adds a create revision compare.
+    #[inline]
     pub fn when_create_revision(
         mut self,
         key_range: KeyRange,
         cmp: TxnCmp,
         revision: usize,
     ) -> Self {
-        let result: CompareResult = cmp.into();
-        self.proto.compare.push(Compare {
-            result: result as i32,
-            target: CompareTarget::Create as i32,
+        let compare_result: Compare_CompareResult = cmp.into();
+        let compare = Compare {
+            result: compare_result,
+            target: Compare_CompareTarget::CREATE,
             key: key_range.key,
             range_end: key_range.range_end,
-            target_union: Some(TargetUnion::CreateRevision(revision as i64)),
-        });
+            target_union: Some(Compare_oneof_target_union::create_revision(revision.cast())),
+            ..Compare::default()
+        };
+        self.proto.compare.push(compare);
         self
     }
 
     /// Adds a mod revision compare.
+    #[inline]
     pub fn when_mod_revision(mut self, key_range: KeyRange, cmp: TxnCmp, revision: usize) -> Self {
-        let result: CompareResult = cmp.into();
-        self.proto.compare.push(Compare {
-            result: result as i32,
-            target: CompareTarget::Mod as i32,
+        let compare_result: Compare_CompareResult = cmp.into();
+        let compare = Compare {
+            result: compare_result,
+            target: Compare_CompareTarget::MOD,
             key: key_range.key,
             range_end: key_range.range_end,
-            target_union: Some(TargetUnion::ModRevision(revision as i64)),
-        });
+            target_union: Some(Compare_oneof_target_union::mod_revision(revision.cast())),
+            ..Compare::default()
+        };
+        self.proto.compare.push(compare);
         self
     }
 
     /// Adds a value compare.
+    #[inline]
     pub fn when_value<V>(mut self, key_range: KeyRange, cmp: TxnCmp, value: V) -> Self
     where
         V: Into<Vec<u8>>,
     {
-        let result: CompareResult = cmp.into();
-        self.proto.compare.push(Compare {
-            result: result as i32,
-            target: CompareTarget::Value as i32,
+        let compare_result: Compare_CompareResult = cmp.into();
+        let compare = Compare {
+            result: compare_result,
+            target: Compare_CompareTarget::VALUE,
             key: key_range.key,
             range_end: key_range.range_end,
-            target_union: Some(TargetUnion::Value(value.into())),
-        });
+            target_union: Some(Compare_oneof_target_union::value(value.into())),
+            ..Compare::default()
+        };
+        self.proto.compare.push(compare);
         self
     }
 
     /// If compare success, then execute the specified operations.
+    #[inline]
     pub fn and_then<O>(mut self, op: O) -> Self
     where
         O: Into<TxnOp>,
@@ -93,6 +113,7 @@ impl TxnRequest {
     }
 
     /// If compare fail, then execute the specified operations.
+    #[inline]
     pub fn or_else<O>(mut self, op: O) -> Self
     where
         O: Into<TxnOp>,
@@ -102,125 +123,148 @@ impl TxnRequest {
     }
 }
 
-impl Default for TxnRequest {
+impl Default for EtcdTxnRequest {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Into<etcdserverpb::TxnRequest> for TxnRequest {
-    fn into(self) -> etcdserverpb::TxnRequest {
+impl Into<TxnRequest> for EtcdTxnRequest {
+    #[inline]
+    fn into(self) -> TxnRequest {
         self.proto
     }
 }
 
 /// Transaction Operation.
 pub enum TxnOp {
-    Range(RangeRequest),
-    Put(PutRequest),
-    Delete(DeleteRequest),
-    Txn(TxnRequest),
+    /// Range fetching operation.
+    Range(EtcdRangeRequest),
+    /// Put operation.
+    Put(EtcdPutRequest),
+    /// Delete operation.
+    Delete(EtcdDeleteRequest),
+    /// Txn operation.
+    Txn(EtcdTxnRequest),
 }
 
-impl Into<etcdserverpb::RequestOp> for TxnOp {
-    fn into(self) -> etcdserverpb::RequestOp {
-        use etcdserverpb::request_op::Request;
-
-        let req = match self {
-            Self::Range(req) => Request::RequestRange(req.into()),
-            Self::Put(req) => Request::RequestPut(req.into()),
-            Self::Delete(req) => Request::RequestDeleteRange(req.into()),
-            Self::Txn(req) => Request::RequestTxn(req.into()),
+impl Into<RequestOp> for TxnOp {
+    fn into(self) -> RequestOp {
+        let mut request_op = RequestOp::new();
+        match self {
+            Self::Range(req) => request_op.set_request_range(req.into()),
+            Self::Put(req) => request_op.set_request_put(req.into()),
+            Self::Delete(req) => request_op.set_request_delete_range(req.into()),
+            Self::Txn(req) => request_op.set_request_txn(req.into()),
         };
-
-        etcdserverpb::RequestOp { request: Some(req) }
+        request_op
     }
 }
 
-impl From<RangeRequest> for TxnOp {
-    fn from(req: RangeRequest) -> Self {
+impl From<EtcdRangeRequest> for TxnOp {
+    fn from(req: EtcdRangeRequest) -> Self {
         Self::Range(req)
     }
 }
 
-impl From<PutRequest> for TxnOp {
-    fn from(req: PutRequest) -> Self {
+impl From<EtcdPutRequest> for TxnOp {
+    fn from(req: EtcdPutRequest) -> Self {
         Self::Put(req)
     }
 }
 
-impl From<DeleteRequest> for TxnOp {
-    fn from(req: DeleteRequest) -> Self {
+impl From<EtcdDeleteRequest> for TxnOp {
+    fn from(req: EtcdDeleteRequest) -> Self {
         Self::Delete(req)
     }
 }
 
-impl From<TxnRequest> for TxnOp {
-    fn from(req: TxnRequest) -> Self {
+impl From<EtcdTxnRequest> for TxnOp {
+    fn from(req: EtcdTxnRequest) -> Self {
         Self::Txn(req)
     }
 }
 
 /// Transaction Comparation.
+#[derive(Clone, Copy)]
 pub enum TxnCmp {
+    /// Equal comparation.
     Equal,
+    /// NotEqual comparation.
     NotEqual,
+    /// Greater comparation.
     Greater,
+    /// Less comparation.
     Less,
 }
 
-impl Into<CompareResult> for TxnCmp {
-    fn into(self) -> CompareResult {
+impl Into<Compare_CompareResult> for TxnCmp {
+    #[inline]
+    fn into(self) -> Compare_CompareResult {
         match self {
-            TxnCmp::Equal => CompareResult::Equal,
-            TxnCmp::NotEqual => CompareResult::NotEqual,
-            TxnCmp::Greater => CompareResult::Greater,
-            TxnCmp::Less => CompareResult::Less,
+            Self::Equal => Compare_CompareResult::EQUAL,
+            Self::NotEqual => Compare_CompareResult::NOT_EQUAL,
+            Self::Greater => Compare_CompareResult::GREATER,
+            Self::Less => Compare_CompareResult::LESS,
         }
     }
 }
 
 /// Response transaction operation.
 pub enum TxnOpResponse {
-    Range(RangeResponse),
-    Put(PutResponse),
-    Delete(DeleteResponse),
-    Txn(TxnResponse),
+    /// Range reponse.
+    Range(EtcdRangeResponse),
+    /// Put reponse.
+    Put(EtcdPutResponse),
+    /// Delete response.
+    Delete(EtcdDeleteResponse),
+    /// Transaction response.
+    Txn(EtcdTxnResponse),
 }
 
-impl From<etcdserverpb::ResponseOp> for TxnOpResponse {
-    fn from(mut resp: etcdserverpb::ResponseOp) -> Self {
-        use etcdserverpb::response_op::Response;
-        match resp.response.take().unwrap() {
-            Response::ResponseRange(r) => Self::Range(From::from(r)),
-            Response::ResponsePut(r) => Self::Put(From::from(r)),
-            Response::ResponseTxn(r) => Self::Txn(From::from(r)),
-            Response::ResponseDeleteRange(r) => Self::Delete(From::from(r)),
+impl From<ResponseOp> for TxnOpResponse {
+    #[inline]
+    fn from(mut resp: ResponseOp) -> Self {
+        match resp
+            .response
+            .take()
+            .unwrap_or_else(|| panic!("Fail to get TxnOpResponse"))
+        {
+            ResponseOp_oneof_response::response_range(r) => Self::Range(From::from(r)),
+            ResponseOp_oneof_response::response_put(r) => Self::Put(From::from(r)),
+            ResponseOp_oneof_response::response_txn(r) => Self::Txn(From::from(r)),
+            ResponseOp_oneof_response::response_delete_range(r) => Self::Delete(From::from(r)),
         }
     }
 }
 
 /// Response for transaction.
 #[derive(Debug)]
-pub struct TxnResponse {
-    proto: etcdserverpb::TxnResponse,
+pub struct EtcdTxnResponse {
+    /// Etcd transaction operations request.
+    proto: TxnResponse,
 }
 
-impl TxnResponse {
+impl EtcdTxnResponse {
     /// Takes the header out of response, leaving a `None` in its place.
+    #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
         match self.proto.header.take() {
             Some(header) => Some(From::from(header)),
-            _ => None,
+            None => None,
         }
     }
 
     /// Returns `true` if the compare evaluated to true, and `false` otherwise.
-    pub fn is_success(&self) -> bool {
+    #[inline]
+    pub const fn is_success(&self) -> bool {
         self.proto.succeeded
     }
 
-    /// Takes the responses corresponding to the results from applying the Success block if succeeded is true or the Failure if succeeded is false.
+    /// Takes the responses corresponding to the results from applying the
+    /// Success block if succeeded is true or the Failure if succeeded is false.
+    #[inline]
     pub fn take_responses(&mut self) -> Vec<TxnOpResponse> {
         let responses = std::mem::take(&mut self.proto.responses);
 
@@ -228,8 +272,9 @@ impl TxnResponse {
     }
 }
 
-impl From<etcdserverpb::TxnResponse> for TxnResponse {
-    fn from(resp: etcdserverpb::TxnResponse) -> Self {
+impl From<TxnResponse> for EtcdTxnResponse {
+    #[inline]
+    fn from(resp: TxnResponse) -> Self {
         Self { proto: resp }
     }
 }

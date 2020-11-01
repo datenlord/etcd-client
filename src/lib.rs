@@ -1,6 +1,48 @@
 //! An asynchronously etcd client for Rust.
 //!
 //! etcd-client supports etcd v3 API and async/await syntax.
+//!
+//! # Examples
+//!
+//! A simple key-value read and write operation:
+//!
+//! ```no_run
+//! use etcd_client::*;
+//!
+//! fn main() -> anyhow::Result<()> {
+//!     smol::block_on(async {
+//!     let client = Client::connect(ClientConfig {
+//!         endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+//!         auth: None,
+//!     }).await?;
+//!
+//!     let key = "foo";
+//!     let value = "bar";
+//!
+//!     // Put a key-value pair
+//!     let resp = client.kv().put(EtcdPutRequest::new(key, value)).await?;
+//!
+//!     println!("Put Response: {:?}", resp);
+//!
+//!     // Get the key-value pair
+//!     let resp = client
+//!         .kv()
+//!         .range(EtcdRangeRequest::new(KeyRange::key(key)))
+//!         .await?;
+//!     println!("Range Response: {:?}", resp);
+//!
+//!     // Delete the key-valeu pair
+//!     let resp = client
+//!         .kv()
+//!         .delete(EtcdDeleteRequest::new(KeyRange::key(key)))
+//!         .await?;
+//!     println!("Delete Response: {:?}", resp);
+//!
+//!     Ok::<(), anyhow::Error>(())
+//!     });
+//!     Ok(())
+//! }
+//! ```
 
 #![deny(
     // The following are allowed by default lints according to
@@ -8,10 +50,10 @@
     anonymous_parameters,
     bare_trait_objects,
     // box_pointers,
-    elided_lifetimes_in_paths, // allow anonymous lifetime
-    // missing_copy_implementations,
+    // elided_lifetimes_in_paths, // allow anonymous lifetime
+    missing_copy_implementations,
     // missing_debug_implementations,
-    // missing_docs, // TODO: add documents
+    missing_docs, // TODO: add documents
     single_use_lifetimes, // TODO: fix lifetime names only used once
     trivial_casts, // TODO: remove trivial casts in code
     trivial_numeric_casts,
@@ -22,53 +64,61 @@
     unused_import_braces,
     unused_qualifications,
     // unused_results,
-    // variant_size_differences,
+    variant_size_differences,
 
     warnings, // treat all wanings as errors
 
     clippy::all,
-    // clippy::restriction,
-    // clippy::pedantic,
-    // clippy::nursery,
-    // clippy::cargo
+    clippy::restriction,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::cargo
 )]
-// #![deny(
-//     clippy::clone_on_ref_ptr,
-//     clippy::dbg_macro,
-//     clippy::enum_glob_use,
-//     clippy::get_unwrap,
-//     clippy::macro_use_imports
-// )]
-// #[allow(
-//     clippy::suspicious_op_assign_impl,
-//     clippy::suspicious_arithmetic_impl,
-//     clippy::module_inception
-// )]
+#![allow(
+    // Some explicitly allowed Clippy lints, must have clear reason to allow
+    clippy::blanket_clippy_restriction_lints, // allow denying clippy::restriction directly
+    clippy::implicit_return, // actually omitting the return keyword is idiomatic Rust code
+    clippy::module_name_repetitions, // repeation of module name in a struct name is not big deal
+    clippy::multiple_crate_versions, // multi-version dependency crates is not able to fix
+    clippy::panic, // allow debug_assert, panic in production code
+)]
 
-pub use auth::{Auth, AuthenticateRequest, AuthenticateResponse};
+pub use auth::{Auth, EtcdAuthenticateRequest, EtcdAuthenticateResponse};
 pub use client::{Client, ClientConfig};
 pub use error::Error;
 pub use kv::{
-    DeleteRequest, DeleteResponse, KeyRange, KeyValue, Kv, PutRequest, PutResponse, RangeRequest,
-    RangeResponse, TxnCmp, TxnOpResponse, TxnRequest, TxnResponse,
+    EtcdDeleteRequest, EtcdDeleteResponse, EtcdPutRequest, EtcdPutResponse, EtcdRangeRequest,
+    EtcdRangeResponse, EtcdTxnRequest, EtcdTxnResponse, KeyRange, KeyValue, Kv, TxnCmp,
+    TxnOpResponse,
 };
 pub use lease::{
-    Lease, LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
-    LeaseRevokeRequest, LeaseRevokeResponse,
+    EtcdLeaseGrantRequest, EtcdLeaseGrantResponse, EtcdLeaseKeepAliveRequest,
+    EtcdLeaseKeepAliveResponse, EtcdLeaseRevokeRequest, EtcdLeaseRevokeResponse, Lease,
 };
 pub use response_header::ResponseHeader;
-pub use watch::{Event, EventType, Watch, WatchRequest, WatchResponse};
+pub use utilities::OverflowArithmetic;
+pub use watch::{EtcdWatchRequest, EtcdWatchResponse, Event, EventType, Watch};
 
+/// Auth mod for authentication operations.
 mod auth;
+/// Client mod for Etcd client operations.
 mod client;
+/// Error mod for Etcd client error.
 mod error;
+/// Kv mod for key-value pairs operations.
 mod kv;
+/// Lazy mod for Etcd client lazy operations.
 mod lazy;
+/// Lease mod for lease operations.
 mod lease;
-mod proto;
+/// Etcd client request and response protos
+mod protos;
+/// Etcd API response header
 mod response_header;
+/// Watch mod for watch operations.
 mod watch;
 
+/// Result with error information
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -77,15 +127,74 @@ mod tests {
     use anyhow::Context;
     use async_compat::Compat;
     use std::collections::HashMap;
+    use utilities::Cast;
 
-    const DEFAULT_ETCD_ENDPOINT_FOR_TEST: &str = "http://127.0.0.1:2379";
+    const DEFAULT_ETCD_ENDPOINT1_FOR_TEST: &str = "127.0.0.1:2379";
+    const DEFAULT_ETCD_ENDPOINT2_FOR_TEST: &str = "127.0.0.1:2380";
 
     #[test]
     fn test_all() -> anyhow::Result<()> {
         smol::block_on(Compat::new(async {
             test_kv().await.context("test etcd kv operations")?;
+            test_transaction()
+                .await
+                .context("test etcd transaction operations")?;
             Ok::<(), anyhow::Error>(())
         }))?;
+        Ok(())
+    }
+
+    async fn test_transaction() -> anyhow::Result<()> {
+        let client = build_etcd_client().await?;
+        test_compose(&client).await?;
+        Ok(())
+    }
+
+    async fn test_compose(client: &Client) -> anyhow::Result<()> {
+        let revision;
+        {
+            let mut resp = client.kv().put(EtcdPutRequest::new("foo", "bar")).await?;
+            revision = resp
+                .take_header()
+                .unwrap_or_else(|| panic!("Fail to take header from response"))
+                .revision();
+
+            for v in 0..10 {
+                let _ = client
+                    .kv()
+                    .put(EtcdPutRequest::new(format!("key-{}", v), format!("{}", v)))
+                    .await?;
+            }
+        }
+
+        let txn = EtcdTxnRequest::new()
+            .when_value(KeyRange::key("foo"), TxnCmp::Equal, "bar")
+            .when_mod_revision(KeyRange::key("foo"), TxnCmp::Equal, revision.cast())
+            .and_then(EtcdPutRequest::new("foo", "bar"))
+            .and_then(EtcdRangeRequest::new(KeyRange::all()))
+            .and_then(EtcdDeleteRequest::new(KeyRange::all()))
+            .and_then(EtcdTxnRequest::new())
+            .or_else(EtcdPutRequest::new("bar", "baz"));
+
+        let mut txn_resp = client.kv().txn(txn).await?;
+
+        for op_resp in txn_resp.take_responses() {
+            match op_resp {
+                TxnOpResponse::Put(_resp) => {}
+                TxnOpResponse::Range(_resp) => {}
+                TxnOpResponse::Delete(resp) => {
+                    assert_eq!(
+                        resp.count_deleted(),
+                        12,
+                        "Deleted wrong value from etcd server"
+                    );
+                }
+                TxnOpResponse::Txn(resp) => {
+                    assert!(resp.is_success(), "Txn did not success from etcd server");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -106,11 +215,11 @@ mod tests {
         test_data.insert("42_bar2", "baz4");
 
         for (key, value) in test_data.clone() {
-            client.kv().put(PutRequest::new(key, value)).await?;
+            client.kv().put(EtcdPutRequest::new(key, value)).await?;
         }
 
         // List key-value pairs with prefix
-        let req = RangeRequest::new(KeyRange::prefix(prefix));
+        let req = EtcdRangeRequest::new(KeyRange::prefix(prefix));
         let mut resp = client.kv().range(req).await?;
 
         for kv in resp.take_kvs() {
@@ -126,18 +235,19 @@ mod tests {
         }
 
         // Delete key-valeu pairs with prefix
-        let req = DeleteRequest::new(KeyRange::prefix(prefix));
-        let resp = client.kv().delete(req).await?;
-        println!("Delete Response: {:?}", resp);
+        let req = EtcdDeleteRequest::new(KeyRange::prefix(prefix));
+        client.kv().delete(req).await?;
 
         Ok(())
     }
 
     async fn build_etcd_client() -> anyhow::Result<Client> {
         let client = Client::connect(ClientConfig {
-            endpoints: vec![DEFAULT_ETCD_ENDPOINT_FOR_TEST.to_owned()],
+            endpoints: vec![
+                DEFAULT_ETCD_ENDPOINT1_FOR_TEST.to_owned(),
+                DEFAULT_ETCD_ENDPOINT2_FOR_TEST.to_owned(),
+            ],
             auth: None,
-            tls: None,
         })
         .await?;
         Ok(client)

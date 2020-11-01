@@ -1,2 +1,2 @@
-etcd for Rust
+etcd client for Rust
 ====

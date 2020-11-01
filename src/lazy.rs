@@ -10,21 +10,21 @@ use crate::Result;
 ///
 /// A `Lazy` holding a `T` is created from a closure returning a `T`.
 /// This closure is not run until the `.read()` method is called.
-pub struct Lazy<T> {
+pub struct Lazy<T: Send> {
     /// The (locked, optional) contents of this Lazy. Initially `None`.
     inner: RwLock<Option<T>>,
     /// A thunk that will instantiate a `T`.
     factory: Box<dyn Fn() -> T + Sync + Send>,
 }
 
-impl<T> Lazy<T> {
+impl<T: Send + Sync> Lazy<T> {
     /// Create a new `Lazy` from a closure.
     ///
     /// This closure will be called lazily on the first request to access to the
     /// `Lazy`'s contents.
     pub fn new<F: 'static + Fn() -> T + Sync + Send>(factory: F) -> Self {
         Self {
-            inner: Default::default(),
+            inner: RwLock::<Option<T>>::default(),
             factory: Box::new(factory),
         }
     }
@@ -56,6 +56,9 @@ impl<T> Lazy<T> {
         LazyReadGuard::new(self.inner.read().await)
     }
 
+    /// Acquire a write lock to the contents of this `Lazy`.
+    ///
+    /// If necessary, first instantiates these contents.
     pub async fn write(&self) -> LazyWriteGuard<'_, T> {
         let mut lock = self.inner.write().await;
         if lock.is_none() {
@@ -77,7 +80,8 @@ pub trait Shutdown {
     async fn shutdown(&mut self) -> Result<()>;
 }
 
-impl<T: Shutdown> Lazy<T> {
+impl<T: Shutdown + Send + Sync> Lazy<T> {
+    /// evict
     pub async fn evict(&self) -> Result<()> {
         let mut lock = self.inner.write().await;
         if let Some(value) = lock.as_mut() {
@@ -93,6 +97,7 @@ impl<T: Shutdown> Lazy<T> {
 /// Much like a `tokio::sync::RwLockReadGuard` (which this type wraps), a
 /// `LazyReadGuard` will release a lock permit on `Drop`.
 pub struct LazyReadGuard<'a, T> {
+    /// inner
     inner: RwLockReadGuard<'a, Option<T>>,
 }
 
@@ -115,7 +120,7 @@ impl<T> Deref for LazyReadGuard<'_, T> {
     fn deref(&self) -> &Self::Target {
         self.inner
             .as_ref()
-            .unwrap_or_else(|| unreachable!() /* see assert! in new() */)
+            .unwrap_or_else(|| panic!("Impossible case, Lazy inner should not be None"))
     }
 }
 
@@ -124,6 +129,7 @@ impl<T> Deref for LazyReadGuard<'_, T> {
 /// Much like a `tokio::sync::RwLockWriteGuard` (which this type wraps), a
 /// `LazyWriteGuard` will release a lock permit on `Drop`.
 pub struct LazyWriteGuard<'a, T> {
+    /// inner
     inner: RwLockWriteGuard<'a, Option<T>>,
 }
 
@@ -146,7 +152,7 @@ impl<T> Deref for LazyWriteGuard<'_, T> {
     fn deref(&self) -> &Self::Target {
         self.inner
             .as_ref()
-            .unwrap_or_else(|| unreachable!() /* see assert! in new() */)
+            .unwrap_or_else(|| panic!("Fail to deref on LazyWriteGuard"))
     }
 }
 
@@ -154,7 +160,7 @@ impl<T> DerefMut for LazyWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
             .as_mut()
-            .unwrap_or_else(|| unreachable!() /* see assert! in new() */)
+            .unwrap_or_else(|| panic!("Fail to deref_mut on LazyWriteGuard"))
     }
 }
 
@@ -231,21 +237,21 @@ mod tests {
 
     #[test]
     fn test_lock_evict() {
+        struct Test {
+            shutdown: Arc<AtomicUsize>,
+        };
+
+        #[async_trait]
+        impl Shutdown for Test {
+            async fn shutdown(&mut self) -> Result<()> {
+                self.shutdown.fetch_add(1, ORDER);
+                Ok(())
+            }
+        }
+
         smol::block_on(async {
             let init_calls = Arc::new(AtomicUsize::default());
             let shutdown_calls = Arc::new(AtomicUsize::default());
-
-            struct Test {
-                shutdown: Arc<AtomicUsize>,
-            };
-
-            #[async_trait]
-            impl Shutdown for Test {
-                async fn shutdown(&mut self) -> Result<()> {
-                    self.shutdown.fetch_add(1, ORDER);
-                    Ok(())
-                }
-            }
 
             let lazy = {
                 let shutdown_calls = Arc::clone(&shutdown_calls);
@@ -275,7 +281,9 @@ mod tests {
                 );
             }
 
-            lazy.evict().await.expect("eviction should not fail");
+            lazy.evict()
+                .await
+                .unwrap_or_else(|e| panic!("eviction should not fail, the error is {}", e));
 
             {
                 let lock = lazy.read().await;
@@ -289,8 +297,12 @@ mod tests {
             }
 
             // Two evictions in a row
-            lazy.evict().await.expect("eviction should not fail");
-            lazy.evict().await.expect("eviction should not fail"); // should be a no-op
+            lazy.evict()
+                .await
+                .unwrap_or_else(|e| panic!("eviction should fail, the error is {}", e));
+            lazy.evict()
+                .await
+                .unwrap_or_else(|e| panic!("eviction should not fail, the error is {}", e)); // should be a no-op
             assert_eq!(
                 init_calls.load(ORDER),
                 2,

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-import "rpc.proto";
+import "proto/rpc.proto";
 
 package v3lockpb;
 

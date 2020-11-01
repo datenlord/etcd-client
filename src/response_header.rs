@@ -1,34 +1,24 @@
-use crate::proto::etcdserverpb;
+use crate::protos::rpc;
+use utilities::Cast;
 
 /// Response header.
+#[derive(Debug)]
 pub struct ResponseHeader {
-    proto: etcdserverpb::ResponseHeader,
+    /// Etcd response header which includes cluster metadata for all responses from etcd API.
+    proto: rpc::ResponseHeader,
 }
 
 impl ResponseHeader {
-    /// Get the ID of the cluster which sent the response.
-    pub fn cluster_id(&self) -> u64 {
-        self.proto.cluster_id
-    }
-
-    /// Get the ID of the member which sent the response.
-    pub fn member_id(&self) -> u64 {
-        self.proto.member_id
-    }
-
     /// Get the key-value store revision when the request was applied.
+    #[inline]
     pub fn revision(&self) -> u64 {
-        self.proto.revision as u64
-    }
-
-    /// Get the raft term when the request was applied.
-    pub fn raft_term(&self) -> u64 {
-        self.proto.raft_term
+        self.proto.revision.cast()
     }
 }
 
-impl From<etcdserverpb::ResponseHeader> for ResponseHeader {
-    fn from(header: etcdserverpb::ResponseHeader) -> Self {
+impl From<rpc::ResponseHeader> for ResponseHeader {
+    #[inline]
+    fn from(header: rpc::ResponseHeader) -> Self {
         Self { proto: header }
     }
 }
