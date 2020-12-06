@@ -1,20 +1,21 @@
+/// Authenticate mode for Etcd authentication operations.
 mod authenticate;
 
-pub use authenticate::{AuthenticateRequest, AuthenticateResponse};
+pub use authenticate::{EtcdAuthenticateRequest, EtcdAuthenticateResponse};
 
-use tonic::transport::Channel;
-
-use crate::proto::etcdserverpb::auth_client::AuthClient;
+use crate::protos::rpc_grpc::AuthClient;
 use crate::Result;
 
-/// Auth client.
+/// Auth client which provides authenticating operation.
 #[derive(Clone)]
 pub struct Auth {
-    client: AuthClient<Channel>,
+    /// Etcd Auth client.
+    client: AuthClient,
 }
 
 impl Auth {
-    pub(crate) fn new(client: AuthClient<Channel>) -> Self {
+    /// Creates a new Auth client.
+    pub(crate) const fn new(client: AuthClient) -> Self {
         Self { client }
     }
 
@@ -22,12 +23,13 @@ impl Auth {
     /// It generates an authentication token based on a given user name and password.
     /// # Errors
     /// Will returns `Err` if the status of `response` is not `ok`
-    pub async fn authenticate(&mut self, req: AuthenticateRequest) -> Result<AuthenticateResponse> {
-        let resp = self
-            .client
-            .authenticate(tonic::Request::new(req.into()))
-            .await?;
+    #[inline]
+    pub async fn authenticate(
+        &mut self,
+        req: EtcdAuthenticateRequest,
+    ) -> Result<EtcdAuthenticateResponse> {
+        let resp = self.client.authenticate(&req.into())?;
 
-        Ok(From::from(resp.into_inner()))
+        Ok(From::from(resp))
     }
 }

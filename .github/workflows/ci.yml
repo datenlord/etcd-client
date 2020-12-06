@@ -6,35 +6,66 @@ on:
   schedule: [cron: "0 0 * * *"]
 
 env:
-  CARGO_TERM_COLOR: always
+  CI_RUST_TOOLCHAIN: 1.47.0
 
 jobs:
   test:
     name: Rust ${{matrix.rust}}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [nightly, beta, stable]
     steps:
+      - name: Install dependencies
+        run: sudo apt install -y cmake g++ libprotobuf-dev protobuf-compiler
+      - name: Prepare docker environment
+        uses: crazy-max/ghaction-docker-buildx@v3
+        with:
+          buildx-version: latest
+          qemu-version: latest
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: ${{matrix.rust}}
+          profile: minimal
+          toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
+          override: true
+      - name: Run etcd service
+        run: |
+          sudo apt install net-tools
+          export ETCD_CONTAINER_NAME=etcd
+          docker run -d --rm --net host --name $ETCD_CONTAINER_NAME gcr.io/etcd-development/etcd:latest
+          docker ps
+          docker logs $ETCD_CONTAINER_NAME
+          sudo netstat -lntp
       - run: cargo test
       - run: cargo check --no-default-features
 
-  clippy:
-    name: Clippy
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
-          components: clippy
+          profile: minimal
+          toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
           override: true
-      - uses: actions-rs/clippy-check@v1
+      - run: rustup component add rustfmt
+      - uses: actions-rs/cargo@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-targets --all-features
+          command: fmt
+          args: --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt install -y cmake g++ libprotobuf-dev protobuf-compiler
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
+          override: true
+      - run: rustup component add clippy
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --all-targets --all-features -- -D warnings

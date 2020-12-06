@@ -1,11 +1,19 @@
+use crate::lease::EtcdLeaseKeepAliveRequest;
+use smol::channel::SendError;
+
 #[derive(thiserror::Error, Debug)]
+/// Error type for etcd-client
 pub enum Error {
+    /// InvalidURI
     #[error("invalid URI")]
     InvalidURI(#[from] http::uri::InvalidUri),
+    /// Transport
     #[error("gRPC transport error")]
-    Transport(#[from] tonic::transport::Error),
-    #[error("response failed")]
-    Response(#[from] tonic::Status),
-    #[error("channel closed")]
-    ChannelClosed,
+    Transport(#[from] grpcio::Error),
+    /// SendError for ()
+    #[error("send error for ()")]
+    SendFailed(#[from] SendError<()>),
+    /// SendError for EtcdLeaseKeepAliveRequest
+    #[error("send error for EtcdLeaseKeepAliveRequest")]
+    SendFailedForLeaseKeepAliveRequest(#[from] SendError<EtcdLeaseKeepAliveRequest>),
 }
