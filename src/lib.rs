@@ -185,7 +185,7 @@ mod tests {
                 TxnOpResponse::Delete(resp) => {
                     assert_eq!(
                         resp.count_deleted(),
-                        12,
+                        11,
                         "Deleted wrong value from etcd server"
                     );
                 }
@@ -221,7 +221,11 @@ mod tests {
         // List key-value pairs with prefix
         let req = EtcdRangeRequest::new(KeyRange::prefix(prefix));
         let mut resp = client.kv().range(req).await?;
-
+        assert_eq!(
+            resp.count(),
+            4,
+            "The number of data fetched from etcd is wrong",
+        );
         for kv in resp.take_kvs() {
             assert!(
                 test_data.contains_key(kv.key_str()),
@@ -235,8 +239,13 @@ mod tests {
         }
 
         // Delete key-valeu pairs with prefix
-        let req = EtcdDeleteRequest::new(KeyRange::prefix(prefix));
-        client.kv().delete(req).await?;
+        let req = EtcdDeleteRequest::new(KeyRange::all());
+        let delete_resp = client.kv().delete(req).await?;
+        assert_eq!(
+            delete_resp.count_deleted(),
+            5,
+            "The number of data deleted in etcd is wrong",
+        );
 
         Ok(())
     }

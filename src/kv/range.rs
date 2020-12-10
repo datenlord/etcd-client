@@ -19,6 +19,7 @@ impl EtcdRangeRequest {
     pub fn new(key_range: KeyRange) -> Self {
         let range_request = RangeRequest {
             key: key_range.key,
+            range_end: key_range.range_end,
             limit: 0,
             revision: 0,
             sort_order: RangeRequest_SortOrder::NONE,
