@@ -224,7 +224,7 @@ impl KeyRange {
         }
 
         let mut first_value = true;
-        let range_end = key
+        let mut range_end = key
             .iter()
             .rev()
             .filter_map(|e| {
@@ -240,6 +240,7 @@ impl KeyRange {
                 }
             })
             .collect::<Vec<u8>>();
+        range_end.reverse();
         Self { key, range_end }
     }
 
