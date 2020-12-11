@@ -238,6 +238,15 @@ mod tests {
             );
         }
 
+        let prefix2 = "41_";
+        let req2 = EtcdRangeRequest::new(KeyRange::prefix(prefix2));
+        let resp2 = client.kv().range(req2).await?;
+        assert_eq!(
+            resp2.count(),
+            1,
+            "The number of data fetched from etcd is wrong",
+        );
+
         // Delete key-valeu pairs with prefix
         let req = EtcdDeleteRequest::new(KeyRange::all());
         let delete_resp = client.kv().delete(req).await?;
