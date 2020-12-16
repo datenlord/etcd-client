@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use smol::stream::Stream;
+use std::net::SocketAddr;
 
 use grpcio::{Channel, ChannelBuilder, EnvBuilder, LbPolicy};
 
@@ -50,11 +51,48 @@ impl Client {
         //     });
         // }
         // Ok(Channel::balance_list(endpoints.into_iter()))
-        let end_points = cfg.endpoints.join(",");
+        if cfg.endpoints.is_empty() {
+            panic!("Empty etcd endpoints");
+        }
+        let mut end_points = cfg.endpoints.join(",");
         let env = Arc::new(EnvBuilder::new().build());
+        if cfg.endpoints.len() > 1 {
+            let socket_address: SocketAddr = cfg
+                .endpoints
+                .first()
+                .unwrap_or_else(|| panic!("Fail to get the first endpoint"))
+                .parse()
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Fail to parse enpoint to socket address, the error is {}",
+                        e,
+                    )
+                });
+            cfg.endpoints.iter().for_each(|endpoint| {
+                let ip: SocketAddr = endpoint.parse().unwrap_or_else(|e| {
+                    panic!(
+                        "Fail to parse enpoint to socket address, the error is {}",
+                        e,
+                    )
+                });
+                if !(socket_address.is_ipv4() && ip.is_ipv4()
+                    || socket_address.is_ipv6() && ip.is_ipv6())
+                {
+                    panic!("Endpoints have different type of ip address schema");
+                }
+            });
+
+            if socket_address.is_ipv4() {
+                end_points = format!("{}:{}", "ipv4", end_points)
+            } else if socket_address.is_ipv6() {
+                end_points = format!("{}:{}", "ipv6", end_points)
+            } else {
+                panic!("unsupported etcd address: {}", socket_address)
+            }
+        }
         let ch = ChannelBuilder::new(env)
             .load_balancing_policy(LbPolicy::RoundRobin)
-            .connect(&format!("{}:{}", "ipv4", end_points));
+            .connect(end_points.as_str());
         Ok(ch)
     }
 
