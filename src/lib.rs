@@ -14,6 +14,8 @@
 //!     let client = Client::connect(ClientConfig {
 //!         endpoints: vec!["http://127.0.0.1:2379".to_owned()],
 //!         auth: None,
+//!         cache_size: 32,
+//!         cache_enable: true,
 //!     }).await?;
 //!
 //!     let key = "foo";
@@ -87,8 +89,8 @@ pub use auth::{Auth, EtcdAuthenticateRequest, EtcdAuthenticateResponse};
 pub use client::{Client, ClientConfig};
 pub use error::Error;
 pub use kv::{
-    EtcdDeleteRequest, EtcdDeleteResponse, EtcdPutRequest, EtcdPutResponse, EtcdRangeRequest,
-    EtcdRangeResponse, EtcdTxnRequest, EtcdTxnResponse, KeyRange, KeyValue, Kv, TxnCmp,
+    EtcdDeleteRequest, EtcdDeleteResponse, EtcdKeyValue, EtcdPutRequest, EtcdPutResponse,
+    EtcdRangeRequest, EtcdRangeResponse, EtcdTxnRequest, EtcdTxnResponse, KeyRange, Kv, TxnCmp,
     TxnOpResponse,
 };
 pub use lease::{
@@ -195,17 +197,27 @@ mod tests {
             }
         }
 
+        // The failure operation should not be proccessed.
+        let req = EtcdRangeRequest::new(KeyRange::key("bar"));
+        let range_resp = client.kv().range(req).await?;
+        assert_eq!(
+            range_resp.count(),
+            0,
+            "The number of data fetched from etcd is wrong",
+        );
+
         Ok(())
     }
 
     async fn test_kv() -> anyhow::Result<()> {
         let client = build_etcd_client().await?;
         test_list_prefix(&client).await?;
+        test_range_query(&client).await?;
         Ok(())
     }
 
-    async fn test_list_prefix(client: &Client) -> anyhow::Result<()> {
-        let prefix = "42_";
+    async fn test_range_query(client: &Client) -> anyhow::Result<()> {
+        let query_key = "41_foo1";
         // Add test data to etcd
         let mut test_data = HashMap::new();
         test_data.insert("41_foo1", "baz1");
@@ -217,6 +229,79 @@ mod tests {
         for (key, value) in test_data.clone() {
             client.kv().put(EtcdPutRequest::new(key, value)).await?;
         }
+
+        let req = EtcdRangeRequest::new(KeyRange::key(query_key));
+        let range_resp = client.kv().range(req).await?;
+        assert_eq!(
+            range_resp.count(),
+            1,
+            "The number of data fetched from etcd is wrong",
+        );
+
+        client
+            .kv()
+            .put(EtcdPutRequest::new(query_key, "newbaz1"))
+            .await?;
+        let req2 = EtcdRangeRequest::new(KeyRange::key(query_key));
+        let mut range_resp2 = client.kv().range(req2).await?;
+        assert_eq!(
+            range_resp2.count(),
+            1,
+            "The number of data fetched from etcd is wrong",
+        );
+        let expect_value: Vec<u8> = "newbaz1".into();
+        assert_eq!(
+            range_resp2
+                .take_kvs()
+                .get(0)
+                .unwrap_or_else(|| panic!("Fail to get key value from RangeResponse"))
+                .value(),
+            expect_value,
+            "The value of updated data fetched from etcd is wrong",
+        );
+
+        // Delete all key-value pairs
+        let req = EtcdDeleteRequest::new(KeyRange::all());
+        let delete_resp = client.kv().delete(req).await?;
+        assert_eq!(
+            delete_resp.count_deleted(),
+            5,
+            "The number of data deleted in etcd is wrong",
+        );
+
+        // After delete all, query one key should return nothing.
+        let req = EtcdRangeRequest::new(KeyRange::key("41_foo1"));
+        let range_resp = client.kv().range(req).await?;
+        assert_eq!(
+            range_resp.count(),
+            0,
+            "The number of data fetched from etcd is wrong",
+        );
+
+        Ok(())
+    }
+
+    async fn test_list_prefix(client: &Client) -> anyhow::Result<()> {
+        let prefix = "42_";
+        // Add test data to etcd
+        let mut test_data = HashMap::new();
+        test_data.insert("41_foo1", "newbaz1");
+        test_data.insert("42_foo1", "newbaz1");
+        test_data.insert("42_foo2", "newbaz2");
+        test_data.insert("42_bar1", "newbaz3");
+        test_data.insert("42_bar2", "newbaz4");
+
+        for (key, value) in test_data.clone() {
+            client.kv().put(EtcdPutRequest::new(key, value)).await?;
+        }
+
+        let req = EtcdRangeRequest::new(KeyRange::key("41_foo1"));
+        let range_resp = client.kv().range(req).await?;
+        assert_eq!(
+            range_resp.count(),
+            1,
+            "The number of data fetched from etcd is wrong",
+        );
 
         // List key-value pairs with prefix
         let req = EtcdRangeRequest::new(KeyRange::prefix(prefix));
@@ -247,13 +332,22 @@ mod tests {
             "The number of data fetched from etcd is wrong",
         );
 
-        // Delete key-valeu pairs with prefix
+        // Delete all key-value pairs
         let req = EtcdDeleteRequest::new(KeyRange::all());
         let delete_resp = client.kv().delete(req).await?;
         assert_eq!(
             delete_resp.count_deleted(),
             5,
             "The number of data deleted in etcd is wrong",
+        );
+
+        // After delete all, query one key should return nothing.
+        let req = EtcdRangeRequest::new(KeyRange::key("41_foo1"));
+        let range_resp = client.kv().range(req).await?;
+        assert_eq!(
+            range_resp.count(),
+            0,
+            "The number of data fetched from etcd is wrong",
         );
 
         Ok(())
@@ -266,6 +360,8 @@ mod tests {
                 DEFAULT_ETCD_ENDPOINT2_FOR_TEST.to_owned(),
             ],
             auth: None,
+            cache_size: 64,
+            cache_enable: true,
         })
         .await?;
         Ok(client)

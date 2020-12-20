@@ -15,6 +15,10 @@ pub struct ClientConfig {
     pub endpoints: Vec<String>,
     /// Etcd Auth configurations (User ID, password).
     pub auth: Option<(String, String)>,
+    /// Etcd client cache size.
+    pub cache_size: usize,
+    /// Enable etcd client cache.
+    pub cache_enable: bool,
 }
 
 /// Client is an abstraction for grouping etcd operations and managing underlying network communications.
@@ -125,13 +129,19 @@ impl Client {
     #[inline]
     pub async fn connect(cfg: ClientConfig) -> Result<Self> {
         let channel = Self::get_channel(&cfg)?;
+        let etcd_watch_client = WatchClient::new(channel.clone());
 
         Ok(Self {
             inner: Arc::new(Inner {
                 channel: channel.clone(),
                 auth_client: Auth::new(AuthClient::new(channel.clone())),
-                kv_client: Kv::new(KvClient::new(channel.clone())),
-                watch_client: Watch::new(WatchClient::new(channel.clone())),
+                kv_client: Kv::new(
+                    KvClient::new(channel.clone()),
+                    &etcd_watch_client,
+                    cfg.cache_size,
+                    cfg.cache_enable,
+                ),
+                watch_client: Watch::new(etcd_watch_client),
                 lease_client: Lease::new(LeaseClient::new(channel)),
             }),
         })

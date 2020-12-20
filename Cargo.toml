@@ -16,9 +16,12 @@ async-compat = "0.1.4"
 async-stream = "0.2"
 async-trait = "0.1"
 bytes = "0.5"
+crossbeam-queue = "0.3.1"
 futures = "0.3.5"
 grpcio = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
 http = "0.2"
+log = "0.4.11"
+lockfree-cuckoohash = { git = "https://github.com/datenlord/lockfree-cuckoohash.git", rev = "be1e03c"}
 protobuf = "2.16.2"
 smol = "1.2.4"
 thiserror = "1.0"

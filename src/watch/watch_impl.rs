@@ -40,9 +40,9 @@ impl EtcdWatchRequest {
     /// Creates a new `WatchRequest` which will unsubscribe the specified watch.
     #[inline]
     #[must_use]
-    pub fn cancel(watch_id: usize) -> Self {
+    pub fn cancel(watch_id: i64) -> Self {
         let mut watch_cancel_request = WatchCancelRequest::new();
-        watch_cancel_request.set_watch_id(watch_id.cast());
+        watch_cancel_request.set_watch_id(watch_id);
         let mut watch_request = WatchRequest::new();
         watch_request.set_cancel_request(watch_cancel_request);
         Self {

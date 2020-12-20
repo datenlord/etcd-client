@@ -16,6 +16,8 @@
 //!         let client = Client::connect(ClientConfig {
 //!             endpoints: vec!["http://127.0.0.1:2379".to_owned()],
 //!             auth: None,
+//!             cache_size: 32,
+//!             cache_enable: true,
 //!         }).await?;
 //!
 //!         let key = "foo";

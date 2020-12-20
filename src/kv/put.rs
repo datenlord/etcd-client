@@ -1,5 +1,5 @@
 use crate::protos::rpc::{PutRequest, PutResponse};
-use crate::KeyValue;
+use crate::EtcdKeyValue;
 use crate::ResponseHeader;
 use utilities::Cast;
 
@@ -53,6 +53,18 @@ impl EtcdPutRequest {
     pub fn set_ignore_lease(&mut self, ignore_lease: bool) {
         self.proto.ignore_lease = ignore_lease;
     }
+
+    /// Gets the key from `PutRequest`.
+    #[inline]
+    pub fn get_key(&self) -> Vec<u8> {
+        self.proto.get_key().to_vec()
+    }
+
+    /// Gets the value from `PutRequest`.
+    #[inline]
+    pub fn get_value(&self) -> Vec<u8> {
+        self.proto.get_value().to_vec()
+    }
 }
 
 impl Into<PutRequest> for EtcdPutRequest {
@@ -81,7 +93,7 @@ impl EtcdPutResponse {
 
     /// Takes the previous key-value pair out of response, leaving a `None` in its place.
     #[inline]
-    pub fn take_prev_kv(&mut self) -> Option<KeyValue> {
+    pub fn take_prev_kv(&mut self) -> Option<EtcdKeyValue> {
         match self.proto.prev_kv.take() {
             Some(kv) => Some(From::from(kv)),
             None => None,
