@@ -1,4 +1,4 @@
-use super::{EtcdKeyValue, KeyRange};
+use super::EtcdKeyValue;
 use crate::protos::rpc::{
     RangeRequest, RangeRequest_SortOrder, RangeRequest_SortTarget, RangeResponse,
 };
@@ -6,20 +6,23 @@ use crate::ResponseHeader;
 use protobuf::RepeatedField;
 use utilities::Cast;
 
-/// Request for fetching key-value pairs.
-pub struct EtcdRangeRequest {
+/// Request for fetching a single key-value pair.
+pub struct EtcdGetRequest {
     /// Etcd range fetching request.
     proto: RangeRequest,
 }
 
-impl EtcdRangeRequest {
-    /// Creates a new `RangeRequest` for the specified key range.
+impl EtcdGetRequest {
+    /// Creates a new `RangeRequest` for a specified key.
     #[inline]
     #[must_use]
-    pub fn new(key_range: KeyRange) -> Self {
+    pub fn new<K>(key: K) -> Self
+    where
+        K: Into<Vec<u8>>,
+    {
         let range_request = RangeRequest {
-            key: key_range.key,
-            range_end: key_range.range_end,
+            key: key.into(),
+            range_end: vec![],
             limit: 0,
             revision: 0,
             sort_order: RangeRequest_SortOrder::NONE,
@@ -47,15 +50,12 @@ impl EtcdRangeRequest {
 
     /// Gets the `key_range` from the `RangeRequest`.
     #[inline]
-    pub fn get_key_range(&self) -> KeyRange {
-        KeyRange {
-            key: self.proto.get_key().to_vec(),
-            range_end: self.proto.get_range_end().to_vec(),
-        }
+    pub fn get_key(&self) -> Vec<u8> {
+        self.proto.get_key().to_vec()
     }
 }
 
-impl Into<RangeRequest> for EtcdRangeRequest {
+impl Into<RangeRequest> for EtcdGetRequest {
     #[inline]
     fn into(self) -> RangeRequest {
         self.proto
@@ -64,13 +64,13 @@ impl Into<RangeRequest> for EtcdRangeRequest {
 
 /// Response for `RangeRequest`.
 #[derive(Debug)]
-pub struct EtcdRangeResponse {
+pub struct EtcdGetResponse {
     /// Etcd range fetching response.
     proto: RangeResponse,
 }
 
-impl EtcdRangeResponse {
-    /// Creates a new `EtcdRangeResponse` for the specified key range.
+impl EtcdGetResponse {
+    /// Creates a new `EtcdGetResponse` for a specified key.
     #[inline]
     pub const fn new(range_response: RangeResponse) -> Self {
         Self {
@@ -114,7 +114,7 @@ impl EtcdRangeResponse {
     }
 }
 
-impl From<RangeResponse> for EtcdRangeResponse {
+impl From<RangeResponse> for EtcdGetResponse {
     #[inline]
     fn from(resp: RangeResponse) -> Self {
         Self { proto: resp }

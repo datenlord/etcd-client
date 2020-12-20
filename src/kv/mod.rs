@@ -1,5 +1,8 @@
+mod cache;
 /// Etcd delete mod for delete operations.
 mod delete;
+/// Etcd get mod for get operations.
+mod get;
 /// Etcd put mod for put operations.
 mod put;
 /// Etcd range mod for range fetching operations.
@@ -7,16 +10,28 @@ mod range;
 /// Etcd txn mod for transaction operations.
 mod txn;
 
-use super::OverflowArithmetic;
+pub use super::watch::EtcdWatchRequest;
+pub use cache::Cache;
 pub use delete::{EtcdDeleteRequest, EtcdDeleteResponse};
+pub use get::{EtcdGetRequest, EtcdGetResponse};
 pub use put::{EtcdPutRequest, EtcdPutResponse};
 pub use range::{EtcdRangeRequest, EtcdRangeResponse};
 pub use txn::{EtcdTxnRequest, EtcdTxnResponse, TxnCmp, TxnOpResponse};
 
-use crate::protos::rpc_grpc::KvClient;
+use super::OverflowArithmetic;
+use crate::protos::kv::Event_EventType;
+use crate::protos::rpc::RangeResponse;
+use crate::protos::rpc_grpc::{KvClient, WatchClient};
+use futures::stream::StreamExt;
+use grpcio::WriteFlags;
+use log::warn;
+use protobuf::RepeatedField;
+use std::str;
 
-use crate::protos::kv;
+use crate::protos::kv::KeyValue;
 use crate::Result as Res;
+use futures::SinkExt;
+use std::sync::Arc;
 use utilities::Cast;
 
 /// Key-Value client.
@@ -24,12 +39,76 @@ use utilities::Cast;
 pub struct Kv {
     /// Etcd Key-Value client.
     client: KvClient,
+    /// Etcd client cache.
+    cache: Arc<Cache>,
+    /// Enable etcd client cache.
+    cache_enable: bool,
 }
+
+/// Etcd client cache default size.
+const ETCD_CACHE_DEFAULT_SIZE: usize = 64;
 
 impl Kv {
     /// Creates a new `KvClient`.
-    pub(crate) const fn new(client: KvClient) -> Self {
-        Self { client }
+    ///
+    /// This method should only be called within etcd client.
+    pub(crate) fn new(
+        client: KvClient,
+        watch_client: &WatchClient,
+        cache_size: usize,
+        cache_enable: bool,
+    ) -> Self {
+        let etcd_cache_size = if cache_size == 0 {
+            ETCD_CACHE_DEFAULT_SIZE
+        } else {
+            cache_size
+        };
+        let cache = Arc::new(Cache::new(etcd_cache_size));
+        let (mut client_req_sender, mut client_resp_receiver) = watch_client
+            .watch()
+            .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
+
+        let cache_inner = Arc::<Cache>::clone(&cache);
+        smol::spawn(async move {
+            let watch_request = EtcdWatchRequest::create(KeyRange::all());
+            client_req_sender
+                .send((watch_request.into(), WriteFlags::default()))
+                .await
+                .unwrap_or_else(|e| panic!("Fail to send watch request, the error is: {}", e));
+
+            while let Some(watch_resp) = client_resp_receiver.next().await {
+                match watch_resp {
+                    Ok(resp) => {
+                        let events = resp.get_events().to_vec();
+                        events.iter().for_each(|event| {
+                            if event.get_field_type() == Event_EventType::PUT {
+                                let value = cache_inner.search(event.get_kv().get_key());
+                                if let Some(valid_value) = value {
+                                    if valid_value.version >= event.get_kv().get_version() {
+                                        return;
+                                    }
+                                }
+                                cache_inner.insert(
+                                    event.get_kv().get_key().to_vec(),
+                                    event.get_kv().clone(),
+                                );
+                            } else {
+                                cache_inner.delete(event.get_kv().get_key());
+                            }
+                        })
+                    }
+                    Err(e) => {
+                        warn!("Watch response contains error, the error is: {}", e);
+                    }
+                }
+            }
+        })
+        .detach();
+        Self {
+            client,
+            cache,
+            cache_enable,
+        }
     }
 
     /// Performs a key-value saving operation.
@@ -43,16 +122,47 @@ impl Kv {
         Ok(From::from(resp.await?))
     }
 
-    /// Performs a key-value fetching operation.
+    /// Performs a single key-value fetching operation.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if RPC call is failed.
+    #[inline]
+    pub async fn get(&mut self, req: EtcdGetRequest) -> Res<EtcdGetResponse> {
+        if self.cache_enable {
+            if let Some(value) = self.cache.search(&req.get_key()) {
+                let mut response = RangeResponse::new();
+                response.set_count(1);
+                response.set_kvs(RepeatedField::from_vec(vec![value]));
+                return Ok(EtcdGetResponse::new(response));
+            }
+        }
+
+        let resp = self.client.range_async(&req.into())?.await?;
+        if self.cache_enable {
+            let kvs = resp.get_kvs();
+            kvs.iter().for_each(|kv| {
+                self.cache.insert(kv.get_key().to_vec(), kv.clone());
+            });
+        }
+        Ok(From::from(resp))
+    }
+
+    /// Performs a range key-value fetching operation.
     ///
     /// # Errors
     ///
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn range(&mut self, req: EtcdRangeRequest) -> Res<EtcdRangeResponse> {
-        let resp = self.client.range_async(&req.into())?;
-
-        Ok(From::from(resp.await?))
+        let resp = self.client.range_async(&req.into())?.await?;
+        if self.cache_enable {
+            let kvs = resp.get_kvs();
+            kvs.iter().for_each(|kv| {
+                self.cache.insert(kv.get_key().to_vec(), kv.clone());
+            });
+        }
+        Ok(From::from(resp))
     }
 
     /// Performs a key-value deleting operation.
@@ -82,12 +192,12 @@ impl Kv {
 
 /// Key-Value pair.
 #[derive(Clone, PartialEq)]
-pub struct KeyValue {
+pub struct EtcdKeyValue {
     /// Etcd `KeyValue` pairs struct.
-    proto: kv::KeyValue,
+    proto: KeyValue,
 }
 
-impl KeyValue {
+impl EtcdKeyValue {
     /// Gets the key in bytes. An empty key is not allowed.
     #[inline]
     pub fn key(&self) -> &[u8] {
@@ -159,9 +269,9 @@ impl KeyValue {
     }
 }
 
-impl From<kv::KeyValue> for KeyValue {
+impl From<KeyValue> for EtcdKeyValue {
     #[inline]
-    fn from(kv: kv::KeyValue) -> Self {
+    fn from(kv: KeyValue) -> Self {
         Self { proto: kv }
     }
 }

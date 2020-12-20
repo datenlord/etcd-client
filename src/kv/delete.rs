@@ -1,4 +1,4 @@
-use super::{KeyRange, KeyValue};
+use super::{EtcdKeyValue, KeyRange};
 use crate::protos::rpc::{DeleteRangeRequest, DeleteRangeResponse};
 use crate::ResponseHeader;
 use protobuf::RepeatedField;
@@ -65,7 +65,7 @@ impl EtcdDeleteResponse {
 
     /// Takes the previous key-value pairs out of response, leaving an empty vector in its place.
     #[inline]
-    pub fn take_prev_kvs(&mut self) -> Vec<KeyValue> {
+    pub fn take_prev_kvs(&mut self) -> Vec<EtcdKeyValue> {
         let kvs = std::mem::replace(&mut self.proto.prev_kvs, RepeatedField::from_vec(vec![]));
 
         kvs.into_iter().map(From::from).collect()
@@ -75,6 +75,17 @@ impl EtcdDeleteResponse {
     #[inline]
     pub fn has_prev_kvs(&self) -> bool {
         !self.proto.prev_kvs.is_empty()
+    }
+
+    /// Gets the previous kvs from `DeleteRangeResponse`.
+    #[inline]
+    pub fn get_prev_kvs(&self) -> Vec<EtcdKeyValue> {
+        self.proto
+            .prev_kvs
+            .clone()
+            .into_iter()
+            .map(From::from)
+            .collect()
     }
 }
 
