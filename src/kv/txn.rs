@@ -121,6 +121,18 @@ impl EtcdTxnRequest {
         self.proto.failure.push(op.into().into());
         self
     }
+
+    /// Get the success operations from `TxnRequest`.
+    #[inline]
+    pub fn get_success_operations(&self) -> Vec<RequestOp> {
+        self.proto.success.to_vec()
+    }
+
+    /// Get the failure operations from `TxnRequest`.
+    #[inline]
+    pub fn get_failure_operations(&self) -> Vec<RequestOp> {
+        self.proto.failure.to_vec()
+    }
 }
 
 impl Default for EtcdTxnRequest {
@@ -240,7 +252,7 @@ impl From<ResponseOp> for TxnOpResponse {
 }
 
 /// Response for transaction.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EtcdTxnResponse {
     /// Etcd transaction operations request.
     proto: TxnResponse,
@@ -269,6 +281,18 @@ impl EtcdTxnResponse {
         let responses = std::mem::take(&mut self.proto.responses);
 
         responses.into_iter().map(From::from).collect()
+    }
+
+    /// Takes the responses corresponding to the results from applying the
+    /// Success block if succeeded is true or the Failure if succeeded is false.
+    #[inline]
+    pub fn get_responses(&self) -> Vec<TxnOpResponse> {
+        self.proto
+            .responses
+            .clone()
+            .into_iter()
+            .map(From::from)
+            .collect()
     }
 }
 

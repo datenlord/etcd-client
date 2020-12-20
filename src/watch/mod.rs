@@ -14,6 +14,8 @@
 //!         let client = Client::connect(ClientConfig {
 //!             endpoints: vec!["http://127.0.0.1:2379".to_owned()],
 //!             auth: None,
+//!             cache_size: 32,
+//!             cache_enable: true,
 //!         }).await?;
 //!
 //!         // print out all received watch responses
@@ -60,8 +62,8 @@ use crate::lazy::{Lazy, Shutdown};
 use crate::protos::kv;
 use crate::protos::rpc;
 use crate::protos::rpc_grpc::WatchClient;
+use crate::EtcdKeyValue;
 use crate::KeyRange;
-use crate::KeyValue;
 use crate::Result;
 use grpcio::WriteFlags;
 
@@ -90,7 +92,7 @@ impl WatchTunnel {
         // Monitor inbound watch response and transfer to the receiver
         let (mut client_req_sender, mut client_resp_receiver) = client
             .watch()
-            .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
+            .unwrap_or_else(|e| panic!("failed to send watch commend, the error is: {}", e));
         smol::spawn(async move {
             let mut shutdown_rx = shutdown_rx.into_future().fuse();
             #[allow(clippy::mut_mut)]
@@ -246,7 +248,7 @@ pub struct Event {
 impl Event {
     /// Takes the key-value pair out of response, leaving a `None` in its place.
     #[inline]
-    pub fn take_kvs(&mut self) -> Option<KeyValue> {
+    pub fn take_kvs(&mut self) -> Option<EtcdKeyValue> {
         match self.proto.kv.take() {
             Some(kv) => Some(From::from(kv)),
             None => None,
