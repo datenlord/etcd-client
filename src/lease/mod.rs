@@ -213,9 +213,9 @@ impl Lease {
     /// Will return `Err` if tunnel is shut down.
     #[inline]
     pub async fn grant(&mut self, req: EtcdLeaseGrantRequest) -> Result<EtcdLeaseGrantResponse> {
-        let resp = self.client.lease_grant(&req.into())?;
+        let resp = self.client.lease_grant_async(&req.into())?;
 
-        Ok(From::from(resp))
+        Ok(From::from(resp.await?))
     }
 
     /// Performs a lease revoking operation.
@@ -224,9 +224,9 @@ impl Lease {
     /// Will return `Err` if tunnel is shut down.
     #[inline]
     pub async fn revoke(&mut self, req: EtcdLeaseRevokeRequest) -> Result<EtcdLeaseRevokeResponse> {
-        let resp = self.client.lease_revoke(&req.into())?;
+        let resp = self.client.lease_revoke_async(&req.into())?;
 
-        Ok(From::from(resp))
+        Ok(From::from(resp.await?))
     }
 
     /// Fetches keep alive response stream.

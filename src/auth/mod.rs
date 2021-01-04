@@ -28,8 +28,8 @@ impl Auth {
         &mut self,
         req: EtcdAuthenticateRequest,
     ) -> Result<EtcdAuthenticateResponse> {
-        let resp = self.client.authenticate(&req.into())?;
+        let resp = self.client.authenticate_async(&req.into())?;
 
-        Ok(From::from(resp))
+        Ok(From::from(resp.await?))
     }
 }

@@ -39,8 +39,8 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn put(&mut self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
-        let resp = self.client.put(&req.into())?;
-        Ok(From::from(resp))
+        let resp = self.client.put_async(&req.into())?;
+        Ok(From::from(resp.await?))
     }
 
     /// Performs a key-value fetching operation.
@@ -50,9 +50,9 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn range(&mut self, req: EtcdRangeRequest) -> Res<EtcdRangeResponse> {
-        let resp = self.client.range(&req.into())?;
+        let resp = self.client.range_async(&req.into())?;
 
-        Ok(From::from(resp))
+        Ok(From::from(resp.await?))
     }
 
     /// Performs a key-value deleting operation.
@@ -62,9 +62,9 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn delete(&mut self, req: EtcdDeleteRequest) -> Res<EtcdDeleteResponse> {
-        let resp = self.client.delete_range(&req.into())?;
+        let resp = self.client.delete_range_async(&req.into())?;
 
-        Ok(From::from(resp))
+        Ok(From::from(resp.await?))
     }
 
     /// Performs a transaction operation.
@@ -74,9 +74,9 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn txn(&mut self, req: EtcdTxnRequest) -> Res<EtcdTxnResponse> {
-        let resp = self.client.txn(&req.into())?;
+        let resp = self.client.txn_async(&req.into())?;
 
-        Ok(From::from(resp))
+        Ok(From::from(resp.await?))
     }
 }
 
