@@ -10,7 +10,7 @@ mod range;
 /// Etcd txn mod for transaction operations.
 mod txn;
 
-pub use super::watch::EtcdWatchRequest;
+pub use super::watch::{EtcdWatchRequest, EtcdWatchResponse};
 pub use cache::Cache;
 pub use delete::{EtcdDeleteRequest, EtcdDeleteResponse};
 pub use get::{EtcdGetRequest, EtcdGetResponse};
@@ -26,12 +26,12 @@ use futures::stream::StreamExt;
 use grpcio::WriteFlags;
 use log::warn;
 use protobuf::RepeatedField;
+use smol::channel::{bounded, unbounded, Sender};
 use std::str;
 
 use crate::protos::kv::KeyValue;
 use crate::Result as Res;
 use futures::SinkExt;
-use std::sync::Arc;
 use utilities::Cast;
 
 /// Key-Value client.
@@ -40,9 +40,11 @@ pub struct Kv {
     /// Etcd Key-Value client.
     client: KvClient,
     /// Etcd client cache.
-    cache: Arc<Cache>,
+    cache: Cache,
     /// Enable etcd client cache.
     cache_enable: bool,
+    /// Etcd watch request sender.
+    watch_sender: Sender<EtcdWatchRequest>,
 }
 
 /// Etcd client cache default size.
@@ -63,39 +65,78 @@ impl Kv {
         } else {
             cache_size
         };
-        let cache = Arc::new(Cache::new(etcd_cache_size));
+
+        let (watch_req_sender, watch_req_receiver) = unbounded::<EtcdWatchRequest>();
+        let (watch_id_sender, watch_id_receiver) = bounded::<i64>(1);
+
+        let cache = Cache::new(etcd_cache_size, watch_req_sender.clone());
         let (mut client_req_sender, mut client_resp_receiver) = watch_client
             .watch()
             .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
 
-        let cache_inner = Arc::<Cache>::clone(&cache);
-        smol::spawn(async move {
-            let watch_request = EtcdWatchRequest::create(KeyRange::all());
-            client_req_sender
-                .send((watch_request.into(), WriteFlags::default()))
-                .await
-                .unwrap_or_else(|e| panic!("Fail to send watch request, the error is: {}", e));
+        let cache_clone = cache.clone();
+        let cache_inner = cache.clone();
 
+        // Task that handles all the pending watch requests.
+        smol::spawn(async move {
+            while let Ok(watch_req) = watch_req_receiver.recv().await {
+                let processing_key = watch_req.get_key();
+                client_req_sender
+                    .send((watch_req.clone().into(), WriteFlags::default()))
+                    .await
+                    .unwrap_or_else(|e| panic!("Fail to send watch request, the error is: {}", e));
+                // Wait until etcd server returns watch id.
+                let watch_id = watch_id_receiver.recv().await.unwrap_or_else(|e| {
+                    panic!("Fail to receive watch id from channel, the error is {}", e)
+                });
+                // Watch request can only be create or cancel.
+                if watch_req.is_create() {
+                    cache_clone.insert_watch_id(processing_key.clone(), watch_id);
+                } else {
+                    cache_clone.delete_watch_id(&processing_key);
+                }
+            }
+        })
+        .detach();
+
+        // Task that handle the watch responses from Etcd server.
+        smol::spawn(async move {
             while let Some(watch_resp) = client_resp_receiver.next().await {
                 match watch_resp {
                     Ok(resp) => {
-                        let events = resp.get_events().to_vec();
-                        events.iter().for_each(|event| {
-                            if event.get_field_type() == Event_EventType::PUT {
-                                let value = cache_inner.search(event.get_kv().get_key());
-                                if let Some(valid_value) = value {
-                                    if valid_value.version >= event.get_kv().get_version() {
-                                        return;
+                        // TODO: Check if need to spawn new task here.
+                        if resp.get_created() || resp.get_canceled() {
+                            watch_id_sender
+                                .send(resp.get_watch_id())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    panic!("Fail to send watch id, the error is {}", e)
+                                });
+                        } else {
+                            let events = resp.get_events().to_vec();
+                            for event in events {
+                                if event.get_field_type() == Event_EventType::PUT {
+                                    if let Some(valid_value) =
+                                        cache_inner.search(event.get_kv().get_key().to_vec()).await
+                                    {
+                                        // Only update the cache if event's version is larger than
+                                        // existing value's version
+                                        if valid_value.version < event.get_kv().get_version() {
+                                            cache_inner
+                                                .insert(
+                                                    event.get_kv().get_key().to_vec(),
+                                                    event.get_kv().clone(),
+                                                )
+                                                .await;
+                                        }
                                     }
+                                } else {
+                                    cache_inner
+                                        .delete(event.get_kv().get_key().to_vec(), true)
+                                        .await;
                                 }
-                                cache_inner.insert(
-                                    event.get_kv().get_key().to_vec(),
-                                    event.get_kv().clone(),
-                                );
-                            } else {
-                                cache_inner.delete(event.get_kv().get_key());
                             }
-                        })
+                        }
                     }
                     Err(e) => {
                         warn!("Watch response contains error, the error is: {}", e);
@@ -108,6 +149,7 @@ impl Kv {
             client,
             cache,
             cache_enable,
+            watch_sender: watch_req_sender,
         }
     }
 
@@ -118,8 +160,24 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn put(&mut self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
-        let resp = self.client.put_async(&req.into())?;
-        Ok(From::from(resp.await?))
+        let key = req.get_key();
+        let value = req.get_value();
+        let resp = self.client.put_async(&req.into())?.await?;
+        if self.cache.search(key.clone()).await == None {
+            let key_value = KeyValue {
+                key: key.clone(),
+                value,
+                ..KeyValue::default()
+            };
+            self.cache.insert(key.clone(), key_value).await;
+            // Creates a new watch request and adds to the send queue.
+            let watch_request = EtcdWatchRequest::create(KeyRange::key(key));
+            self.watch_sender
+                .send(watch_request)
+                .await
+                .unwrap_or_else(|e| panic!("Fail to send watch request, the error is {}", e));
+        }
+        Ok(From::from(resp))
     }
 
     /// Performs a single key-value fetching operation.
@@ -130,7 +188,7 @@ impl Kv {
     #[inline]
     pub async fn get(&mut self, req: EtcdGetRequest) -> Res<EtcdGetResponse> {
         if self.cache_enable {
-            if let Some(value) = self.cache.search(&req.get_key()) {
+            if let Some(value) = self.cache.search(req.get_key()).await {
                 let mut response = RangeResponse::new();
                 response.set_count(1);
                 response.set_kvs(RepeatedField::from_vec(vec![value]));
@@ -141,9 +199,19 @@ impl Kv {
         let resp = self.client.range_async(&req.into())?.await?;
         if self.cache_enable {
             let kvs = resp.get_kvs();
-            kvs.iter().for_each(|kv| {
-                self.cache.insert(kv.get_key().to_vec(), kv.clone());
-            });
+            for kv in kvs {
+                if self.cache.search(kv.get_key().to_vec()).await == None {
+                    // Creates a new watch request and adds to the send queue.
+                    let watch_request = EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
+                    self.watch_sender
+                        .send(watch_request)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("Fail to send watch request, the error is {}", e)
+                        });
+                }
+                self.cache.insert(kv.get_key().to_vec(), kv.clone()).await;
+            }
         }
         Ok(From::from(resp))
     }
@@ -155,14 +223,7 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn range(&mut self, req: EtcdRangeRequest) -> Res<EtcdRangeResponse> {
-        let resp = self.client.range_async(&req.into())?.await?;
-        if self.cache_enable {
-            let kvs = resp.get_kvs();
-            kvs.iter().for_each(|kv| {
-                self.cache.insert(kv.get_key().to_vec(), kv.clone());
-            });
-        }
-        Ok(From::from(resp))
+        Ok(From::from(self.client.range_async(&req.into())?.await?))
     }
 
     /// Performs a key-value deleting operation.

@@ -8,7 +8,7 @@ use crate::ResponseHeader;
 use utilities::Cast;
 
 /// Request for creating or canceling watch.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EtcdWatchRequest {
     /// Etcd watch key request.
     proto: WatchRequest,
@@ -84,6 +84,27 @@ impl EtcdWatchRequest {
         {
             req.prev_kv = prev_kv
         }
+    }
+
+    /// Gets the watch key.
+    /// It only effects when the request is for subscribing.
+    #[inline]
+    pub fn get_key(&self) -> Vec<u8> {
+        if let Some(WatchRequest_oneof_request_union::create_request(req)) =
+            self.proto.request_union.clone()
+        {
+            return req.get_key().to_vec();
+        }
+        vec![]
+    }
+
+    /// Returns if the watch request is a create watch request.
+    #[inline]
+    pub fn is_create(&self) -> bool {
+        if self.proto.has_create_request() {
+            return true;
+        }
+        false
     }
 }
 
