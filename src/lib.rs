@@ -9,7 +9,7 @@
 //! ```no_run
 //! use etcd_client::*;
 //!
-//! fn main() -> anyhow::Result<()> {
+//! fn main() -> Result<()> {
 //!     smol::block_on(async {
 //!     let client = Client::connect(ClientConfig {
 //!         endpoints: vec!["http://127.0.0.1:2379".to_owned()],
@@ -40,9 +40,8 @@
 //!         .await?;
 //!     println!("Delete Response: {:?}", resp);
 //!
-//!     Ok::<(), anyhow::Error>(())
-//!     });
 //!     Ok(())
+//!     })
 //! }
 //! ```
 
@@ -97,6 +96,8 @@ pub use lease::{
     EtcdLeaseGrantRequest, EtcdLeaseGrantResponse, EtcdLeaseKeepAliveRequest,
     EtcdLeaseKeepAliveResponse, EtcdLeaseRevokeRequest, EtcdLeaseRevokeResponse, Lease,
 };
+pub use lock::Lock;
+pub use lock::{EtcdLockRequest, EtcdLockResponse, EtcdUnlockRequest, EtcdUnlockResponse};
 pub use response_header::ResponseHeader;
 pub use utilities::OverflowArithmetic;
 pub use watch::{EtcdWatchRequest, EtcdWatchResponse, Event, EventType, Watch};
@@ -113,6 +114,8 @@ mod kv;
 mod lazy;
 /// Lease mod for lease operations.
 mod lease;
+/// Lock mod for lock operations.
+mod lock;
 /// Etcd client request and response protos
 mod protos;
 /// Etcd API response header
@@ -123,26 +126,120 @@ mod watch;
 /// Result with error information
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The default value for current interval value
+pub const CURRENT_INTERVAL_VALUE: u64 = 1;
+/// The key of the default value for current interval environment variable
+pub const CURRENT_INTERVAL_ENV_KEY: &str = "CURRENT_INTERVAL";
+/// The default value for current initial value
+pub const INITIAL_INTERVAL_VALUE: u64 = 1;
+/// The key of the default value for initial interval environment variable
+pub const INITIAL_INTERVAL_ENV_KEY: &str = "INITIAL_INTERVAL";
+/// The default value for max elapsed value
+pub const MAX_ELAPSED_TIME_VALUE: u64 = 10;
+/// The key of the default value for max elapsed environment variable
+pub const MAX_ELAPSED_TIME_ENV_KEY: &str = "MAX_ELAPSED_TIME";
+
+/// A retry macro to immediately attempt a function call after failure
+#[macro_export]
+macro_rules! retryable {
+    ($args:expr) => {
+        retry(
+            ExponentialBackoff {
+                current_interval: Duration::from_secs(match std::env::var(CURRENT_INTERVAL_ENV_KEY) {
+                    Ok(val) => val.parse().unwrap(),
+                    Err(_) => CURRENT_INTERVAL_VALUE.to_owned()
+                }),
+                initial_interval: Duration::from_secs(match std::env::var(INITIAL_INTERVAL_ENV_KEY) {
+                    Ok(val) => val.parse().unwrap(),
+                    Err(_) => INITIAL_INTERVAL_VALUE.to_owned()
+                }),
+                max_elapsed_time: Some(Duration::from_secs(match std::env::var(MAX_ELAPSED_TIME_ENV_KEY) {
+                    Ok(val) => val.parse().unwrap(),
+                    Err(_) => MAX_ELAPSED_TIME_VALUE.to_owned()
+                })),
+                ..ExponentialBackoff::default()
+            },
+            $args,
+        )
+        .await?
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
     use async_compat::Compat;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use std::time::SystemTime;
     use utilities::Cast;
 
     const DEFAULT_ETCD_ENDPOINT1_FOR_TEST: &str = "127.0.0.1:2379";
-    const DEFAULT_ETCD_ENDPOINT2_FOR_TEST: &str = "127.0.0.1:2380";
+    // Should not connect 2380 port, which will cause lock operation error.
+    //const DEFAULT_ETCD_ENDPOINT2_FOR_TEST: &str = "127.0.0.1:2380";
 
     #[test]
-    fn test_all() -> anyhow::Result<()> {
+    fn test_all() -> Result<()> {
         smol::block_on(Compat::new(async {
             test_kv().await.context("test etcd kv operations")?;
             test_transaction()
                 .await
                 .context("test etcd transaction operations")?;
+            test_lock().await.context("test etcd lock operations")?;
             Ok::<(), anyhow::Error>(())
         }))?;
+        Ok(())
+    }
+
+    async fn test_lock() -> anyhow::Result<()> {
+        // 1. Lock on "ABC"
+        let client = build_etcd_client().await?;
+        let lease_id = client
+            .lease()
+            .grant(EtcdLeaseGrantRequest::new(Duration::from_secs(10)))
+            .await?
+            .id();
+        let lease_id_2 = client
+            .lease()
+            .grant(EtcdLeaseGrantRequest::new(Duration::from_secs(10)))
+            .await?
+            .id();
+        let key_bytes = client
+            .lock()
+            .lock(EtcdLockRequest::new(b"ABC".to_vec(), lease_id))
+            .await?
+            .take_key();
+
+        // 2. Wait until the first lock released automatically
+        let time1 = SystemTime::now();
+        let key_bytes2 = client
+            .lock()
+            .lock(EtcdLockRequest::new(b"ABC".to_vec(), lease_id_2))
+            .await?
+            .take_key();
+        let time2 = SystemTime::now();
+
+        // wait a least 5 seconds (the first lock has a 10s lease)
+        assert!(time2.duration_since(time1)?.as_secs() > 5);
+
+        let key_slice = key_bytes.as_slice();
+        assert_eq!(
+            key_slice
+                .get(..3)
+                .unwrap_or_else(|| panic!("key slice get first 3 bytes failed")),
+            b"ABC".to_vec()
+        );
+
+        // 3. Release all locks
+        client
+            .lock()
+            .unlock(EtcdUnlockRequest::new(key_bytes))
+            .await?;
+
+        client
+            .lock()
+            .unlock(EtcdUnlockRequest::new(key_bytes2))
+            .await?;
         Ok(())
     }
 
@@ -152,7 +249,7 @@ mod tests {
         Ok(())
     }
 
-    async fn test_compose(client: &Client) -> anyhow::Result<()> {
+    async fn test_compose(client: &Client) -> Result<()> {
         let revision;
         {
             let mut resp = client.kv().put(EtcdPutRequest::new("foo", "bar")).await?;
@@ -209,14 +306,14 @@ mod tests {
         Ok(())
     }
 
-    async fn test_kv() -> anyhow::Result<()> {
+    async fn test_kv() -> Result<()> {
         let client = build_etcd_client().await?;
         test_list_prefix(&client).await?;
         test_range_query(&client).await?;
         Ok(())
     }
 
-    async fn test_range_query(client: &Client) -> anyhow::Result<()> {
+    async fn test_range_query(client: &Client) -> Result<()> {
         let query_key = "41_foo1";
         // Add test data to etcd
         let mut test_data = HashMap::new();
@@ -281,7 +378,7 @@ mod tests {
         Ok(())
     }
 
-    async fn test_list_prefix(client: &Client) -> anyhow::Result<()> {
+    async fn test_list_prefix(client: &Client) -> Result<()> {
         let prefix = "42_";
         // Add test data to etcd
         let mut test_data = HashMap::new();
@@ -353,11 +450,11 @@ mod tests {
         Ok(())
     }
 
-    async fn build_etcd_client() -> anyhow::Result<Client> {
+    async fn build_etcd_client() -> Result<Client> {
         let client = Client::connect(ClientConfig {
             endpoints: vec![
                 DEFAULT_ETCD_ENDPOINT1_FOR_TEST.to_owned(),
-                DEFAULT_ETCD_ENDPOINT2_FOR_TEST.to_owned(),
+                //DEFAULT_ETCD_ENDPOINT2_FOR_TEST.to_owned(),
             ],
             auth: None,
             cache_size: 64,

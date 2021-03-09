@@ -7,6 +7,7 @@ use protobuf::RepeatedField;
 use utilities::Cast;
 
 /// Request for fetching key-value pairs.
+#[derive(Debug, Clone)]
 pub struct EtcdRangeRequest {
     /// Etcd range fetching request.
     proto: RangeRequest,

@@ -11,6 +11,7 @@ use protobuf::RepeatedField;
 use utilities::Cast;
 
 /// Request for performing transaction operations.
+#[derive(Debug, Clone)]
 pub struct EtcdTxnRequest {
     /// Etcd transaction operations request.
     proto: TxnRequest,

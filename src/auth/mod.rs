@@ -4,7 +4,17 @@ mod authenticate;
 pub use authenticate::{EtcdAuthenticateRequest, EtcdAuthenticateResponse};
 
 use crate::protos::rpc_grpc::AuthClient;
+use crate::retryable;
 use crate::Result;
+use backoff::future::retry;
+use backoff::ExponentialBackoff;
+use std::time::Duration;
+use crate::CURRENT_INTERVAL_VALUE;
+use crate::CURRENT_INTERVAL_ENV_KEY;
+use crate::INITIAL_INTERVAL_VALUE;
+use crate::INITIAL_INTERVAL_ENV_KEY;
+use crate::MAX_ELAPSED_TIME_VALUE;
+use crate::MAX_ELAPSED_TIME_ENV_KEY;
 
 /// Auth client which provides authenticating operation.
 #[derive(Clone)]
@@ -28,8 +38,10 @@ impl Auth {
         &mut self,
         req: EtcdAuthenticateRequest,
     ) -> Result<EtcdAuthenticateResponse> {
-        let resp = self.client.authenticate_async(&req.into())?;
-
-        Ok(From::from(resp.await?))
+        let authenticate_result = retryable!(|| async {
+            let resp = self.client.authenticate_async(&req.clone().into())?;
+            Ok(From::from(resp.await?))
+        });
+        Ok(authenticate_result)
     }
 }

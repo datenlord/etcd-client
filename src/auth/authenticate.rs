@@ -2,6 +2,7 @@ use crate::protos::rpc::{AuthenticateRequest, AuthenticateResponse};
 use crate::ResponseHeader;
 
 /// Request for authenticating.
+#[derive(Debug, Clone)]
 pub struct EtcdAuthenticateRequest {
     /// Etcd authenticate request.
     proto: AuthenticateRequest,

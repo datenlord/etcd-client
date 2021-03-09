@@ -11,7 +11,7 @@
 //!
 //! use etcd_client::*;
 //!
-//! fn main() -> anyhow::Result<()> {
+//! fn main() -> Result<()> {
 //!     smol::block_on(async {
 //!         let client = Client::connect(ClientConfig {
 //!             endpoints: vec!["http://127.0.0.1:2379".to_owned()],
@@ -52,9 +52,8 @@
 //!         // spawned by the client
 //!         client.shutdown().await;
 //!
-//!         Ok::<(), anyhow::Error>(())
-//!     });
-//!     Ok(())
+//!         Ok(())
+//!     })
 //! }
 //! ```
 
@@ -62,9 +61,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::FutureExt;
-use futures::stream::StreamExt;
-
 use futures::prelude::*;
+use futures::stream::StreamExt;
 
 use smol::channel::{unbounded, Receiver, Sender};
 use smol::stream::Stream;
@@ -76,7 +74,17 @@ pub use revoke::{EtcdLeaseRevokeRequest, EtcdLeaseRevokeResponse};
 use crate::lazy::{Lazy, Shutdown};
 use crate::protos::rpc;
 use crate::protos::rpc_grpc::LeaseClient;
+use crate::retryable;
 use crate::Result;
+use backoff::future::retry;
+use backoff::ExponentialBackoff;
+use std::time::Duration;
+use crate::CURRENT_INTERVAL_VALUE;
+use crate::CURRENT_INTERVAL_ENV_KEY;
+use crate::INITIAL_INTERVAL_VALUE;
+use crate::INITIAL_INTERVAL_ENV_KEY;
+use crate::MAX_ELAPSED_TIME_VALUE;
+use crate::MAX_ELAPSED_TIME_ENV_KEY;
 
 use grpcio::WriteFlags;
 
@@ -110,6 +118,7 @@ impl LeaseKeepAliveTunnel {
         let (mut client_req_sender, mut client_resp_receiver) = client
             .lease_keep_alive()
             .unwrap_or_else(|e| panic!("Fail to lease_keep_alive, the error is: {}", e));
+
         smol::spawn(async move {
             let mut shutdown_rx = shutdown_rx.into_future().fuse();
             #[allow(clippy::mut_mut)]
@@ -215,9 +224,11 @@ impl Lease {
     /// Will return `Err` if tunnel is shut down.
     #[inline]
     pub async fn grant(&mut self, req: EtcdLeaseGrantRequest) -> Result<EtcdLeaseGrantResponse> {
-        let resp = self.client.lease_grant_async(&req.into())?;
-
-        Ok(From::from(resp.await?))
+        let resp = retryable!(|| async {
+            let resp = self.client.lease_grant_async(&req.clone().into())?;
+            Ok(From::from(resp.await?))
+        });
+        Ok(resp)
     }
 
     /// Performs a lease revoking operation.
@@ -226,9 +237,11 @@ impl Lease {
     /// Will return `Err` if tunnel is shut down.
     #[inline]
     pub async fn revoke(&mut self, req: EtcdLeaseRevokeRequest) -> Result<EtcdLeaseRevokeResponse> {
-        let resp = self.client.lease_revoke_async(&req.into())?;
-
-        Ok(From::from(resp.await?))
+        let resp = retryable!(|| async {
+            let resp = self.client.lease_revoke_async(&req.clone().into())?;
+            Ok(From::from(resp.await?))
+        });
+        Ok(resp)
     }
 
     /// Fetches keep alive response stream.
