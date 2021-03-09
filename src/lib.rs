@@ -97,6 +97,8 @@ pub use lease::{
     EtcdLeaseGrantRequest, EtcdLeaseGrantResponse, EtcdLeaseKeepAliveRequest,
     EtcdLeaseKeepAliveResponse, EtcdLeaseRevokeRequest, EtcdLeaseRevokeResponse, Lease,
 };
+pub use lock::Lock;
+pub use lock::{EtcdLockRequest, EtcdLockResponse, EtcdUnlockRequest, EtcdUnlockResponse};
 pub use response_header::ResponseHeader;
 pub use utilities::OverflowArithmetic;
 pub use watch::{EtcdWatchRequest, EtcdWatchResponse, Event, EventType, Watch};
@@ -113,6 +115,8 @@ mod kv;
 mod lazy;
 /// Lease mod for lease operations.
 mod lease;
+/// Lock mod for lock operations.
+mod lock;
 /// Etcd client request and response protos
 mod protos;
 /// Etcd API response header
@@ -129,10 +133,13 @@ mod tests {
     use anyhow::Context;
     use async_compat::Compat;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use std::time::SystemTime;
     use utilities::Cast;
 
     const DEFAULT_ETCD_ENDPOINT1_FOR_TEST: &str = "127.0.0.1:2379";
-    const DEFAULT_ETCD_ENDPOINT2_FOR_TEST: &str = "127.0.0.1:2380";
+    // Should not connect 2380 port, which will cause lock operation error.
+    //const DEFAULT_ETCD_ENDPOINT2_FOR_TEST: &str = "127.0.0.1:2380";
 
     #[test]
     fn test_all() -> anyhow::Result<()> {
@@ -141,8 +148,61 @@ mod tests {
             test_transaction()
                 .await
                 .context("test etcd transaction operations")?;
+            test_lock().await.context("test etcd lock operations")?;
             Ok::<(), anyhow::Error>(())
         }))?;
+        Ok(())
+    }
+
+    async fn test_lock() -> anyhow::Result<()> {
+        // 1. Lock on "ABC"
+        let client = build_etcd_client().await?;
+        let lease_id = client
+            .lease()
+            .grant(EtcdLeaseGrantRequest::new(Duration::from_secs(10)))
+            .await?
+            .id();
+        let lease_id_2 = client
+            .lease()
+            .grant(EtcdLeaseGrantRequest::new(Duration::from_secs(10)))
+            .await?
+            .id();
+        let key_bytes = client
+            .lock()
+            .lock(EtcdLockRequest::new(b"ABC".to_vec(), lease_id))
+            .await?
+            .take_key();
+
+        // 2. Wait until the first lock released automatically
+        let time1 = SystemTime::now();
+        let key_bytes2 = client
+            .lock()
+            .lock(EtcdLockRequest::new(b"ABC".to_vec(), lease_id_2))
+            .await?
+            .take_key();
+        let time2 = SystemTime::now();
+
+        // wait a least 5 seconds (the first lock has a 10s lease)
+        assert!(time2.duration_since(time1)?.as_secs() > 5);
+
+        let key_slice = key_bytes.as_slice();
+        assert_eq!(
+            key_slice
+                .get(..3)
+                .unwrap_or_else(|| panic!("key slice get first 3 bytes failed")),
+            b"ABC".to_vec()
+        );
+
+        // 3. Release all locks
+        client
+            .lock()
+            .unlock(EtcdUnlockRequest::new(key_bytes))
+            .await?;
+
+        client
+            .lock()
+            .unlock(EtcdUnlockRequest::new(key_bytes2))
+            .await?;
         Ok(())
     }
 
@@ -357,7 +417,7 @@ mod tests {
         let client = Client::connect(ClientConfig {
             endpoints: vec![
                 DEFAULT_ETCD_ENDPOINT1_FOR_TEST.to_owned(),
-                DEFAULT_ETCD_ENDPOINT2_FOR_TEST.to_owned(),
+                //DEFAULT_ETCD_ENDPOINT2_FOR_TEST.to_owned(),
             ],
             auth: None,
             cache_size: 64,

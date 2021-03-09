@@ -5,9 +5,12 @@ use std::net::SocketAddr;
 
 use grpcio::{Channel, ChannelBuilder, EnvBuilder, LbPolicy};
 
-use crate::protos::rpc_grpc::{AuthClient, KvClient, LeaseClient, WatchClient};
+use crate::protos::{
+    lock_grpc::LockClient,
+    rpc_grpc::{AuthClient, KvClient, LeaseClient, WatchClient},
+};
 use crate::watch::EtcdWatchResponse;
-use crate::{Auth, KeyRange, Kv, Lease, Result, Watch};
+use crate::{Auth, KeyRange, Kv, Lease, Lock, Result, Watch};
 
 /// Config for establishing etcd client.
 pub struct ClientConfig {
@@ -41,11 +44,13 @@ pub struct Inner {
     watch_client: Watch,
     /// Lease client for lease operations.
     lease_client: Lease,
+    /// Lock client for lock operations.
+    lock_client: Lock,
 }
 
 impl Client {
     /// Get grpc channel.
-    fn get_channel(cfg: &ClientConfig) -> Result<Channel> {
+    fn get_channel(cfg: &ClientConfig) -> Channel {
         // let mut endpoints = Vec::with_capacity(cfg.endpoints.len());
         // for e in cfg.endpoints.iter() {
         //     let c = Channel::from_shared(e.to_owned())?;
@@ -97,7 +102,7 @@ impl Client {
         let ch = ChannelBuilder::new(env)
             .load_balancing_policy(LbPolicy::RoundRobin)
             .connect(end_points.as_str());
-        Ok(ch)
+        ch
     }
 
     /// Connects to etcd generate auth token.
@@ -128,7 +133,7 @@ impl Client {
     /// Will returns `Err` if failed to contact with given endpoints or authentication failed.
     #[inline]
     pub async fn connect(cfg: ClientConfig) -> Result<Self> {
-        let channel = Self::get_channel(&cfg)?;
+        let channel = Self::get_channel(&cfg);
         let etcd_watch_client = WatchClient::new(channel.clone());
 
         Ok(Self {
@@ -142,7 +147,8 @@ impl Client {
                     cfg.cache_enable,
                 ),
                 watch_client: Watch::new(etcd_watch_client),
-                lease_client: Lease::new(LeaseClient::new(channel)),
+                lease_client: Lease::new(LeaseClient::new(channel.clone())),
+                lock_client: Lock::new(LockClient::new(channel)),
             }),
         })
     }
@@ -159,6 +165,13 @@ impl Client {
     #[must_use]
     pub fn kv(&self) -> Kv {
         self.inner.kv_client.clone()
+    }
+
+    /// Get a lock client.
+    #[inline]
+    #[must_use]
+    pub fn lock(&self) -> Lock {
+        self.inner.lock_client.clone()
     }
 
     /// Gets a watch client.
