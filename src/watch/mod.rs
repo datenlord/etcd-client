@@ -9,7 +9,7 @@
 //! use etcd_client::*;
 //! use futures::stream::StreamExt;
 //!
-//! fn main() -> anyhow::Result<()> {
+//! fn main() -> Result<()> {
 //!     smol::block_on(async {
 //!         let client = Client::connect(ClientConfig {
 //!             endpoints: vec!["http://127.0.0.1:2379".to_owned()],
@@ -38,9 +38,8 @@
 //!         // spawned by the client
 //!         client.shutdown().await;
 //!
-//!         Ok::<(), anyhow::Error>(())
-//!     });
-//!     Ok(())
+//!         Ok(())
+//!     })
 //! }
 //!
 //! ```

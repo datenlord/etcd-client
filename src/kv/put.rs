@@ -4,6 +4,7 @@ use crate::ResponseHeader;
 use utilities::Cast;
 
 /// Request for putting key-value.
+#[derive(Debug, Clone)]
 pub struct EtcdPutRequest {
     /// Etcd put key-value pairs request.
     proto: PutRequest,

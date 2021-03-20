@@ -3,6 +3,7 @@ use crate::ResponseHeader;
 use utilities::Cast;
 
 /// Request for revoking lease.
+#[derive(Debug, Clone)]
 pub struct EtcdLeaseRevokeRequest {
     /// Etcd lease revoke request.
     proto: LeaseRevokeRequest,

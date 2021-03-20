@@ -5,6 +5,7 @@ use protobuf::RepeatedField;
 use utilities::Cast;
 
 /// Request for deleting key-value pairs.
+#[derive(Debug, Clone)]
 pub struct EtcdDeleteRequest {
     /// Etcd delete range key-value pairs request.
     proto: DeleteRangeRequest,
