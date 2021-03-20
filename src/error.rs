@@ -3,7 +3,7 @@ use smol::channel::SendError;
 
 #[derive(thiserror::Error, Debug)]
 /// Error type for etcd-client
-pub enum Error {
+pub enum EtcdError {
     /// InvalidURI
     #[error("invalid URI")]
     InvalidURI(#[from] http::uri::InvalidUri),

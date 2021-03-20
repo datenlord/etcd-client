@@ -5,6 +5,7 @@ use crate::ResponseHeader;
 use utilities::Cast;
 
 /// Request for granting lease.
+#[derive(Debug, Clone)]
 pub struct EtcdLeaseGrantRequest {
     /// Etcd lease grant request.
     proto: LeaseGrantRequest,

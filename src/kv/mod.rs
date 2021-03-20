@@ -22,12 +22,22 @@ use super::OverflowArithmetic;
 use crate::protos::kv::Event_EventType;
 use crate::protos::rpc::RangeResponse;
 use crate::protos::rpc_grpc::{KvClient, WatchClient};
+use crate::retryable;
+use crate::CURRENT_INTERVAL_ENV_KEY;
+use crate::CURRENT_INTERVAL_VALUE;
+use crate::INITIAL_INTERVAL_ENV_KEY;
+use crate::INITIAL_INTERVAL_VALUE;
+use crate::MAX_ELAPSED_TIME_ENV_KEY;
+use crate::MAX_ELAPSED_TIME_VALUE;
+use backoff::future::retry;
+use backoff::ExponentialBackoff;
 use futures::stream::StreamExt;
 use grpcio::WriteFlags;
 use log::warn;
 use protobuf::RepeatedField;
 use smol::channel::{bounded, unbounded, Sender};
 use std::str;
+use std::time::Duration;
 
 use crate::protos::kv::KeyValue;
 use crate::Result as Res;
@@ -140,6 +150,7 @@ impl Kv {
                     }
                     Err(e) => {
                         warn!("Watch response contains error, the error is: {}", e);
+                        break;
                     }
                 }
             }
@@ -162,7 +173,10 @@ impl Kv {
     pub async fn put(&mut self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
         let key = req.get_key();
         let value = req.get_value();
-        let resp = self.client.put_async(&req.into())?.await?;
+        let resp = retryable!(|| async {
+            let resp = self.client.put_async(&req.clone().into())?;
+            Ok(From::from(resp.await?))
+        });
         if self.cache.search(key.clone()).await == None {
             let key_value = KeyValue {
                 key: key.clone(),
@@ -177,7 +191,7 @@ impl Kv {
                 .await
                 .unwrap_or_else(|e| panic!("Fail to send watch request, the error is {}", e));
         }
-        Ok(From::from(resp))
+        Ok(resp)
     }
 
     /// Performs a single key-value fetching operation.
@@ -196,7 +210,10 @@ impl Kv {
             }
         }
 
-        let resp = self.client.range_async(&req.into())?.await?;
+        let resp = retryable!(|| async {
+            let resp = self.client.range_async(&req.clone().into())?;
+            Ok(resp.await?)
+        });
         if self.cache_enable {
             let kvs = resp.get_kvs();
             for kv in kvs {
@@ -223,7 +240,11 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn range(&mut self, req: EtcdRangeRequest) -> Res<EtcdRangeResponse> {
-        Ok(From::from(self.client.range_async(&req.into())?.await?))
+        let resp = retryable!(|| async {
+            let resp = self.client.range_async(&req.clone().into())?;
+            Ok(From::from(resp.await?))
+        });
+        Ok(resp)
     }
 
     /// Performs a key-value deleting operation.
@@ -233,9 +254,11 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn delete(&mut self, req: EtcdDeleteRequest) -> Res<EtcdDeleteResponse> {
-        let resp = self.client.delete_range_async(&req.into())?;
-
-        Ok(From::from(resp.await?))
+        let resp = retryable!(|| async {
+            let resp = self.client.delete_range_async(&req.clone().into())?;
+            Ok(From::from(resp.await?))
+        });
+        Ok(resp)
     }
 
     /// Performs a transaction operation.
@@ -245,9 +268,11 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn txn(&mut self, req: EtcdTxnRequest) -> Res<EtcdTxnResponse> {
-        let resp = self.client.txn_async(&req.into())?;
-
-        Ok(From::from(resp.await?))
+        let resp = retryable!(|| async {
+            let resp = self.client.txn_async(&req.clone().into())?;
+            Ok(From::from(resp.await?))
+        });
+        Ok(resp)
     }
 }
 
