@@ -102,6 +102,9 @@ pub use response_header::ResponseHeader;
 pub use utilities::OverflowArithmetic;
 pub use watch::{EtcdWatchRequest, EtcdWatchResponse, Event, EventType, Watch};
 
+use backoff::{future::Sleeper, Notify};
+use std::{future::Future, pin::Pin, time::Duration};
+
 /// Auth mod for authentication operations.
 mod auth;
 /// Client mod for Etcd client operations.
@@ -143,7 +146,8 @@ pub const MAX_ELAPSED_TIME_ENV_KEY: &str = "MAX_ELAPSED_TIME";
 #[macro_export]
 macro_rules! retryable {
     ($args:expr) => {
-        retry(
+        backoff::future::Retry::new(
+            crate::SmolSleeper,
             ExponentialBackoff {
                 current_interval: Duration::from_secs(
                     match std::env::var(CURRENT_INTERVAL_ENV_KEY) {
@@ -165,10 +169,35 @@ macro_rules! retryable {
                 )),
                 ..ExponentialBackoff::default()
             },
+            crate::NoopNotify,
             $args,
         )
         .await?
     };
+}
+
+/// The notifier does nothing
+#[derive(Debug, Clone, Copy)]
+pub struct NoopNotify;
+
+impl<E> Notify<E> for NoopNotify {
+    #[inline]
+    fn notify(&mut self, _: E, _: Duration) {}
+}
+
+/// The smol sleeper wrapper
+struct SmolSleeper;
+
+impl Sleeper for SmolSleeper {
+    type Sleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+    fn sleep(&self, dur: Duration) -> Self::Sleep {
+        Box::pin(sleep(dur))
+    }
+}
+
+/// A wrapper for smol sleep
+async fn sleep(d: Duration) {
+    smol::Timer::after(d).await;
 }
 
 #[cfg(test)]
