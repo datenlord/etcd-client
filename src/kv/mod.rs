@@ -172,20 +172,16 @@ impl Kv {
     #[inline]
     pub async fn put(&mut self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
         let key = req.get_key();
-        let value = req.get_value();
-        let resp = retryable!(|| async {
+        let resp: EtcdPutResponse = retryable!(|| async {
             let resp = self.client.put_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
+
         if self.cache.search(key.clone()).await == None {
-            let key_value = KeyValue {
-                key: key.clone(),
-                value,
-                ..KeyValue::default()
-            };
-            self.cache.insert(key.clone(), key_value).await;
+            let revision = resp.get_revision();
             // Creates a new watch request and adds to the send queue.
-            let watch_request = EtcdWatchRequest::create(KeyRange::key(key));
+            let mut watch_request = EtcdWatchRequest::create(KeyRange::key(key));
+            watch_request.set_start_revision(revision.cast());
             self.watch_sender
                 .send(watch_request)
                 .await

@@ -100,6 +100,12 @@ impl EtcdPutResponse {
             None => None,
         }
     }
+
+    /// Gets the revision of the key-value store when generating the response.
+    #[inline]
+    pub fn get_revision(&self) -> i64 {
+        self.proto.get_header().revision
+    }
 }
 
 impl From<PutResponse> for EtcdPutResponse {
