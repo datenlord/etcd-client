@@ -15,7 +15,7 @@ async-compat = "0.1.4"
 async-stream = "0.2"
 async-std = "1.8.0"
 async-trait = "0.1"
-backoff = { version = "0.3.0", features = ["async-std"] }
+backoff = { version = "0.3.0", features = ["futures"] }
 bytes = "0.5"
 futures = "0.3.5"
 grpcio = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }

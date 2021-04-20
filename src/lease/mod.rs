@@ -83,7 +83,6 @@ use crate::INITIAL_INTERVAL_ENV_KEY;
 use crate::INITIAL_INTERVAL_VALUE;
 use crate::MAX_ELAPSED_TIME_ENV_KEY;
 use crate::MAX_ELAPSED_TIME_VALUE;
-use backoff::future::retry;
 use backoff::ExponentialBackoff;
 use std::time::Duration;
 
