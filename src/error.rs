@@ -16,4 +16,7 @@ pub enum EtcdError {
     /// SendError for EtcdLeaseKeepAliveRequest
     #[error("send error for EtcdLeaseKeepAliveRequest")]
     SendFailedForLeaseKeepAliveRequest(#[from] SendError<EtcdLeaseKeepAliveRequest>),
+    /// Internal Error
+    #[error("Internal Error: {0}")]
+    InternalError(String),
 }

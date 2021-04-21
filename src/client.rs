@@ -39,7 +39,7 @@ pub struct Inner {
     /// Auth client for authentication operations.
     auth_client: Auth,
     /// Key-Value client for key-value operations.
-    kv_client: Kv,
+    kv_client: Arc<Kv>,
     /// Watch client for watch operations.
     watch_client: Watch,
     /// Lease client for lease operations.
@@ -163,8 +163,8 @@ impl Client {
     /// Gets a key-value client.
     #[inline]
     #[must_use]
-    pub fn kv(&self) -> Kv {
-        self.inner.kv_client.clone()
+    pub fn kv(&self) -> Arc<Kv> {
+        Arc::<Kv>::clone(&self.inner.kv_client)
     }
 
     /// Get a lock client.
