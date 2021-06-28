@@ -14,8 +14,9 @@ This is an [etcd](https://github.com/etcd-io/etcd)(API v3) client for Rust, whic
 ## Road Map
 - [x] 0.1 Replace the tokio and tonic library with smol and grpc-rs, which are more lightweight libraries.
 - [x] 0.2 Refactor etcd api to use grpc-rs async APIs to provide real async functionalities.
-- [ ] 0.3 Apply the single key-value lock free Cache to etcd client, which is based on the etcd watch mechanism.
-- [ ] 0.4 Apply the lru replacement policies with lock to etcd Cache.
-- [ ] 0.5 Add the retry with exponential backoff mechanism to etcd client.
-- [ ] 0.6 Support the lock free lru replacement policies to etcd Cache.
-- [ ] 0.7 Support range key-value Cache.
+- [x] 0.3 Apply the single key-value lock free Cache to etcd client, which is based on the etcd watch mechanism.
+- [x] 0.4 Apply the lru replacement policies with lock to etcd Cache.
+- [x] 0.5 Add the retry with exponential backoff mechanism to etcd client.
+- [ ] 0.6 Support the Cache recovery mechanism.
+- [ ] 0.7 Support the lock free lru replacement policies to etcd Cache.
+- [ ] 0.8 Support range key-value Cache.
