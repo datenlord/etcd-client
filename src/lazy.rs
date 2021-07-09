@@ -239,7 +239,7 @@ mod tests {
     fn test_lock_evict() {
         struct Test {
             shutdown: Arc<AtomicUsize>,
-        };
+        }
 
         #[async_trait]
         impl Shutdown for Test {

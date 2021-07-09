@@ -103,84 +103,87 @@ impl Kv {
         let this_clone = Arc::<Self>::clone(&this);
         let this_clone2 = Arc::<Self>::clone(&this);
 
-        // Task that handles all the pending watch requests.
-        smol::spawn(async move {
-            while let Ok(watch_req) = watch_req_receiver.recv().await {
-                let processing_key = watch_req.get_key();
-                if let Err(e) = client_req_sender
-                    .send((watch_req.clone().into(), WriteFlags::default()))
-                    .await
-                {
-                    warn!("Fail to send watch request, the error is: {}", e);
-                    this_clone.cache_err.store(true, Ordering::Release);
-                    break;
-                }
-                // Wait until etcd server returns watch id.
-                let watch_id = match watch_id_receiver.recv().await {
-                    Err(e) => {
-                        warn!("Fail to receive watch id from channel, the error is {}", e);
+        if cache_enable {
+            // Task that handles all the pending watch requests.
+            smol::spawn(async move {
+                while let Ok(watch_req) = watch_req_receiver.recv().await {
+                    let processing_key = watch_req.get_key();
+                    if let Err(e) = client_req_sender
+                        .send((watch_req.clone().into(), WriteFlags::default()))
+                        .await
+                    {
+                        warn!("Fail to send watch request, the error is: {}", e);
                         this_clone.cache_err.store(true, Ordering::Release);
                         break;
                     }
-                    Ok(id) => id,
-                };
-                // Watch request can only be create or cancel.
-                if watch_req.is_create() {
-                    cache_clone.insert_watch_id(processing_key.clone(), watch_id);
-                } else {
-                    cache_clone.delete_watch_id(&processing_key);
+                    // Wait until etcd server returns watch id.
+                    let watch_id = match watch_id_receiver.recv().await {
+                        Err(e) => {
+                            warn!("Fail to receive watch id from channel, the error is {}", e);
+                            this_clone.cache_err.store(true, Ordering::Release);
+                            break;
+                        }
+                        Ok(id) => id,
+                    };
+                    // Watch request can only be create or cancel.
+                    if watch_req.is_create() {
+                        cache_clone.insert_watch_id(processing_key.clone(), watch_id);
+                    } else {
+                        cache_clone.delete_watch_id(&processing_key);
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
 
-        // Task that handle the watch responses from Etcd server.
-        smol::spawn(async move {
-            while let Some(watch_resp) = client_resp_receiver.next().await {
-                match watch_resp {
-                    Ok(resp) => {
-                        // TODO: Check if need to spawn new task here.
-                        if resp.get_created() || resp.get_canceled() {
-                            if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
-                                warn!("Fail to send watch id, the error is {}", e);
-                                this_clone2.cache_err.store(true, Ordering::Release);
-                                break;
-                            }
-                        } else {
-                            let events = resp.get_events().to_vec();
-                            for event in events {
-                                if event.get_field_type() == Event_EventType::PUT {
-                                    if let Some(valid_value) =
-                                        cache_inner.search(event.get_kv().get_key().to_vec()).await
-                                    {
-                                        // Only update the cache if event's version is larger than
-                                        // existing value's version
-                                        if valid_value.version < event.get_kv().get_version() {
-                                            cache_inner
-                                                .insert(
-                                                    event.get_kv().get_key().to_vec(),
-                                                    event.get_kv().clone(),
-                                                )
-                                                .await;
+            // Task that handle the watch responses from Etcd server.
+            smol::spawn(async move {
+                while let Some(watch_resp) = client_resp_receiver.next().await {
+                    match watch_resp {
+                        Ok(resp) => {
+                            // TODO: Check if need to spawn new task here.
+                            if resp.get_created() || resp.get_canceled() {
+                                if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
+                                    warn!("Fail to send watch id, the error is {}", e);
+                                    this_clone2.cache_err.store(true, Ordering::Release);
+                                    break;
+                                }
+                            } else {
+                                let events = resp.get_events().to_vec();
+                                for event in events {
+                                    if event.get_field_type() == Event_EventType::PUT {
+                                        if let Some(valid_value) = cache_inner
+                                            .search(event.get_kv().get_key().to_vec())
+                                            .await
+                                        {
+                                            // Only update the cache if event's version is larger than
+                                            // existing value's version
+                                            if valid_value.version < event.get_kv().get_version() {
+                                                cache_inner
+                                                    .insert(
+                                                        event.get_kv().get_key().to_vec(),
+                                                        event.get_kv().clone(),
+                                                    )
+                                                    .await;
+                                            }
                                         }
+                                    } else {
+                                        cache_inner
+                                            .delete(event.get_kv().get_key().to_vec(), true)
+                                            .await;
                                     }
-                                } else {
-                                    cache_inner
-                                        .delete(event.get_kv().get_key().to_vec(), true)
-                                        .await;
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!("Watch response contains error, the error is: {}", e);
-                        this_clone2.cache_err.store(true, Ordering::Release);
-                        break;
+                        Err(e) => {
+                            warn!("Watch response contains error, the error is: {}", e);
+                            this_clone2.cache_err.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        };
 
         this
     }
@@ -192,7 +195,7 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn put(&self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
-        if self.cache_err.load(Ordering::Acquire) {
+        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
             return Err(EtcdError::InternalError("Kv cache meets an error".into()));
         }
 
@@ -202,7 +205,7 @@ impl Kv {
             Ok(From::from(resp.await?))
         });
 
-        if self.cache.search(key.clone()).await == None {
+        if self.cache_enable && self.cache.search(key.clone()).await == None {
             let revision = resp.get_revision();
             // Creates a new watch request and adds to the send queue.
             let mut watch_request = EtcdWatchRequest::create(KeyRange::key(key));
@@ -222,7 +225,7 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn get(&self, req: EtcdGetRequest) -> Res<EtcdGetResponse> {
-        if self.cache_err.load(Ordering::Acquire) {
+        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
             return Err(EtcdError::InternalError("Kv cache meets an error".into()));
         }
         if self.cache_enable {
@@ -263,7 +266,7 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn range(&self, req: EtcdRangeRequest) -> Res<EtcdRangeResponse> {
-        if self.cache_err.load(Ordering::Acquire) {
+        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
             return Err(EtcdError::InternalError("Kv cache meets an error".into()));
         }
         let resp = retryable!(|| async {
@@ -280,7 +283,7 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn delete(&self, req: EtcdDeleteRequest) -> Res<EtcdDeleteResponse> {
-        if self.cache_err.load(Ordering::Acquire) {
+        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
             return Err(EtcdError::InternalError("Kv cache meets an error".into()));
         }
         let resp = retryable!(|| async {
@@ -297,7 +300,7 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn txn(&self, req: EtcdTxnRequest) -> Res<EtcdTxnResponse> {
-        if self.cache_err.load(Ordering::Acquire) {
+        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
             return Err(EtcdError::InternalError("Kv cache meets an error".into()));
         }
         let resp = retryable!(|| async {
