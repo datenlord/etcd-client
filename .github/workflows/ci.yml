@@ -26,7 +26,10 @@ jobs:
           profile: minimal
           toolchain: ${{ env.CI_RUST_TOOLCHAIN }}
           override: true
-      - name: Run etcd service
+      - name: Test mock etcd
+        run: cargo test -p mock-etcd
+
+      - name: Test etcd client
         run: |
           sudo apt install net-tools
           export ETCD_CONTAINER_NAME=etcd
@@ -34,8 +37,7 @@ jobs:
           docker ps
           docker logs $ETCD_CONTAINER_NAME
           sudo netstat -lntp
-      - run: cargo test
-      - run: cargo check --no-default-features
+          cargo test -p etcd-client
 
   fmt:
     name: Format

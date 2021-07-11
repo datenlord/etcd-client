@@ -72,7 +72,7 @@ mod kv;
     clippy::nursery,
     clippy::cargo
 )]
-mod etcd;
+mod rpc;
 // Ignore format and lint to generated code
 #[rustfmt::skip]
 #[allow(
@@ -83,7 +83,7 @@ mod etcd;
     clippy::nursery,
     clippy::cargo
 )]
-mod etcd_grpc;
+mod rpc_grpc;
 // Ignore format and lint to generated code
 #[rustfmt::skip]
 #[allow(

@@ -1,16 +1,16 @@
 //! The implementation for Mock Etcd
 
-use super::etcd::{
+use super::kv::{Event, Event_EventType, KeyValue};
+use super::lock::{LockRequest, LockResponse, UnlockRequest, UnlockResponse};
+use super::lock_grpc::{create_lock, Lock};
+use super::rpc::{
     CompactionRequest, CompactionResponse, DeleteRangeRequest, DeleteRangeResponse,
     LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
     LeaseRevokeRequest, LeaseRevokeResponse, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse,
     PutRequest, PutResponse, RangeRequest, RangeResponse, TxnRequest, TxnResponse, WatchRequest,
     WatchResponse,
 };
-use super::etcd_grpc::{create_kv, create_lease, create_watch, Kv, Lease, Watch};
-use super::kv::{Event, Event_EventType, KeyValue};
-use super::lock::{LockRequest, LockResponse, UnlockRequest, UnlockResponse};
-use super::lock_grpc::{create_lock, Lock};
+use super::rpc_grpc::{create_kv, create_lease, create_watch, Kv, Lease, Watch};
 use async_io::Timer;
 use async_lock::RwLock;
 use futures::future::TryFutureExt;
@@ -620,14 +620,14 @@ mod test {
         smol::future::block_on(async {
             let mock_etcd = MockEtcd::new();
             // Test insert
-            let mut put000 = crate::etcd::PutRequest::new();
-            let mut put001 = crate::etcd::PutRequest::new();
-            let mut put010 = crate::etcd::PutRequest::new();
-            let mut put011 = crate::etcd::PutRequest::new();
-            let mut put100 = crate::etcd::PutRequest::new();
-            let mut put101 = crate::etcd::PutRequest::new();
-            let mut put110 = crate::etcd::PutRequest::new();
-            let mut put111 = crate::etcd::PutRequest::new();
+            let mut put000 = crate::rpc::PutRequest::new();
+            let mut put001 = crate::rpc::PutRequest::new();
+            let mut put010 = crate::rpc::PutRequest::new();
+            let mut put011 = crate::rpc::PutRequest::new();
+            let mut put100 = crate::rpc::PutRequest::new();
+            let mut put101 = crate::rpc::PutRequest::new();
+            let mut put110 = crate::rpc::PutRequest::new();
+            let mut put111 = crate::rpc::PutRequest::new();
             put000.set_key(vec![0_u8, 0_u8, 0_u8]);
             put001.set_key(vec![0_u8, 0_u8, 1_u8]);
             put010.set_key(vec![0_u8, 1_u8, 0_u8]);
@@ -741,24 +741,24 @@ mod test {
             );
             // Test get
             // get one key
-            let mut one_key_1 = crate::etcd::RangeRequest::new();
+            let mut one_key_1 = crate::rpc::RangeRequest::new();
             one_key_1.set_key(vec![0_u8]);
             one_key_1.set_range_end(vec![]);
-            let mut one_key_2 = crate::etcd::RangeRequest::new();
+            let mut one_key_2 = crate::rpc::RangeRequest::new();
             one_key_2.set_key(vec![0_u8, 0_u8, 0_u8]);
             one_key_2.set_range_end(vec![]);
             // get all keys
-            let mut all_keys = crate::etcd::RangeRequest::new();
+            let mut all_keys = crate::rpc::RangeRequest::new();
             all_keys.set_key(vec![0_u8]);
             all_keys.set_range_end(vec![0_u8]);
             // get range
-            let mut range1 = crate::etcd::RangeRequest::new();
+            let mut range1 = crate::rpc::RangeRequest::new();
             range1.set_key(vec![0_u8, 0_u8, 0_u8]);
             range1.set_range_end(vec![0_u8, 1_u8, 0_u8]);
-            let mut range2 = crate::etcd::RangeRequest::new();
+            let mut range2 = crate::rpc::RangeRequest::new();
             range2.set_key(vec![0_u8, 0_u8, 0_u8]);
             range2.set_range_end(vec![1_u8, 1_u8, 1_u8]);
-            let mut range2 = crate::etcd::RangeRequest::new();
+            let mut range2 = crate::rpc::RangeRequest::new();
             range2.set_key(vec![0_u8, 1_u8, 1_u8]);
             range2.set_range_end(vec![1_u8, 1_u8, 1_u8]);
 
@@ -793,19 +793,19 @@ mod test {
             );
 
             // Test delete
-            let mut delete_no_exist = crate::etcd::DeleteRangeRequest::new();
+            let mut delete_no_exist = crate::rpc::DeleteRangeRequest::new();
             delete_no_exist.set_key(vec![0_u8]);
             delete_no_exist.set_range_end(vec![]);
 
-            let mut delete_one_key = crate::etcd::DeleteRangeRequest::new();
+            let mut delete_one_key = crate::rpc::DeleteRangeRequest::new();
             delete_one_key.set_key(vec![1_u8, 1_u8, 1_u8]);
             delete_one_key.set_range_end(vec![]);
             // delete range
-            let mut delete_range = crate::etcd::DeleteRangeRequest::new();
+            let mut delete_range = crate::rpc::DeleteRangeRequest::new();
             delete_range.set_key(vec![0_u8, 0_u8, 0_u8]);
             delete_range.set_range_end(vec![0_u8, 1_u8, 0_u8]);
             // delete all
-            let mut delete_all = crate::etcd::DeleteRangeRequest::new();
+            let mut delete_all = crate::rpc::DeleteRangeRequest::new();
             delete_all.set_key(vec![0_u8]);
             delete_all.set_range_end(vec![0_u8]);
 

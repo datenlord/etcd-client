@@ -25,5 +25,5 @@ smol = { version = "1.2.5" }
 protoc-grpcio = "2.0.0"
 
 [dev-dependencies]
-etcd-client = { git = "https://github.com/datenlord/etcd-client", rev = "3b56c53" }
+etcd-client = { path = "../etcd-client" }
 async-compat = "0.1.4"
