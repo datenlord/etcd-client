@@ -1,0 +1,32 @@
+[package]
+name = "etcd-client"
+version = "0.1.0"
+authors = ["Qi Tian <mrwwheat@gmail.com>"]
+edition = "2018"
+keywords = ["etcd", "future", "async"]
+repository = "https://github.com/datenlord/etcd-client"
+homepage = "https://github.com/datenlord/etcd-client"
+description = "etcd client for datenlord"
+license = "MIT"
+categories = ["filesystem"]
+
+[dependencies]
+async-compat = "0.1.4"
+async-stream = "0.2"
+async-std = "1.8.0"
+async-trait = "0.1"
+backoff = { version = "0.3.0", features = ["futures"] }
+bytes = "0.5"
+futures = "0.3.5"
+grpcio = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
+http = "0.2"
+log = "0.4.11"
+lockfree-cuckoohash = { git = "https://github.com/datenlord/lockfree-cuckoohash.git", rev = "be1e03c"}
+priority-queue = "1.0.5"
+protobuf = "2.16.2"
+smol = "1.2.4"
+thiserror = "1.0"
+utilities = { git = "https://github.com/datenlord/utilities", rev = "4ef408d"}
+
+[build-dependencies]
+protoc-grpcio = "2.0.0"
