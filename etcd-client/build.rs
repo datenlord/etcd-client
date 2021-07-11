@@ -9,7 +9,7 @@ fn main() {
             "proto/rpc.proto",
             "proto/lock.proto",
         ], // inputs
-        &["."],       // includes
+        &[".."],      // includes
         "src/protos", // output
         None,         // customizations
     )

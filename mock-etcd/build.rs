@@ -6,12 +6,12 @@ fn main() {
         &[
             "proto/auth.proto",
             "proto/kv.proto",
-            "proto/etcd.proto",
+            "proto/rpc.proto",
             "proto/lock.proto",
         ], // inputs
-        &["proto"], // includes
-        "src",      // output
-        None,       // customizations
+        &[".."], // includes
+        "src",   // output
+        None,    // customizations
     )
     .unwrap_or_else(|_| panic!("Failed to compile gRPC definitions!"));
 }
