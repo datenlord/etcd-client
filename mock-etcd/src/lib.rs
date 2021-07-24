@@ -1,5 +1,5 @@
 //! Mock etcd service
-
+/*
 #![deny(
     // The following are allowed by default lints according to
     // https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html
@@ -38,6 +38,7 @@
     clippy::multiple_crate_versions, // multi-version dependency crates is not able to fix
     clippy::panic, // allow debug_assert, panic in production code
 )]
+*/
 
 // Ignore format and lint to generated code
 #[rustfmt::skip]

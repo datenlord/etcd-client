@@ -102,7 +102,7 @@ impl WatchTunnel {
                     res = client_req_sender.send(
                         (watch_request, WriteFlags::default())
                     ).fuse() => res.unwrap_or_else(
-                        |e| panic!("Fail to send reqponse, the error is {}", e)
+                        |e| panic!("Fail to send request, the error is {}", e)
                     ),
                     _ = shutdown_rx => return
                 };
