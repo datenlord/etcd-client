@@ -91,7 +91,7 @@ impl WatchTunnel {
         // Monitor inbound watch response and transfer to the receiver
         let (mut client_req_sender, mut client_resp_receiver) = client
             .watch()
-            .unwrap_or_else(|e| panic!("failed to send watch commend, the error is: {}", e));
+            .unwrap_or_else(|e| panic!("failed to send watch command, the error is: {}", e));
         smol::spawn(async move {
             let mut shutdown_rx = shutdown_rx.into_future().fuse();
             #[allow(clippy::mut_mut)]

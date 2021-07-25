@@ -110,7 +110,7 @@ impl Cache {
         if self.hashtable.size() > self.hashtable.capacity().overflow_mul(6).overflow_div(10) {
             let queue = self.lru_queue.lock().await;
             if let Some(pop_value) = queue.peek() {
-                self.delete(pop_value.0.to_vec().clone(), false).await;
+                self.delete(pop_value.0.to_vec().clone(), true).await;
             }
         }
     }
