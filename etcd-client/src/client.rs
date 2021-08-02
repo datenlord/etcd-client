@@ -39,7 +39,7 @@ pub struct Inner {
     /// Auth client for authentication operations.
     auth_client: Auth,
     /// Key-Value client for key-value operations.
-    kv_client: Arc<Kv>,
+    kv_client: Kv,
     /// Watch client for watch operations.
     watch_client: Watch,
     /// Lease client for lease operations.
@@ -142,7 +142,7 @@ impl Client {
                 auth_client: Auth::new(AuthClient::new(channel.clone())),
                 kv_client: Kv::new(
                     KvClient::new(channel.clone()),
-                    &etcd_watch_client,
+                    etcd_watch_client.clone(),
                     cfg.cache_size,
                     cfg.cache_enable,
                 ),
@@ -163,8 +163,8 @@ impl Client {
     /// Gets a key-value client.
     #[inline]
     #[must_use]
-    pub fn kv(&self) -> Arc<Kv> {
-        Arc::<Kv>::clone(&self.inner.kv_client)
+    pub fn kv(&self) -> Kv {
+        self.inner.kv_client.clone()
     }
 
     /// Get a lock client.
@@ -209,6 +209,7 @@ impl Client {
         watch_client.shutdown().await?;
         let mut lease_client = self.inner.lease_client.clone();
         lease_client.shutdown().await?;
+        self.inner.kv_client.shutdown().await?;
         Ok(())
     }
 }

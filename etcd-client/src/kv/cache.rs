@@ -38,7 +38,7 @@ impl Cache {
     pub async fn search(&self, key: Vec<u8>) -> Option<KeyValue> {
         let search_result = {
             let guard = pin();
-            self.hashtable.search_with_guard(&key, &guard).cloned()
+            self.hashtable.get(&key, &guard).cloned()
         };
         match search_result {
             Some(value) => {
@@ -88,7 +88,7 @@ impl Cache {
     /// Searches a watch id for a specific key.
     pub fn search_watch_id(&self, key: &[u8]) -> Option<i64> {
         let guard = pin();
-        let search_result = self.watch_id_table.search_with_guard(&key.to_vec(), &guard);
+        let search_result = self.watch_id_table.get(&key.to_vec(), &guard);
         match search_result {
             Some(value) => Some(*value),
             None => None,
@@ -110,8 +110,19 @@ impl Cache {
         if self.hashtable.size() > self.hashtable.capacity().overflow_mul(6).overflow_div(10) {
             let queue = self.lru_queue.lock().await;
             if let Some(pop_value) = queue.peek() {
-                self.delete(pop_value.0.to_vec().clone(), false).await;
+                self.delete(pop_value.0.to_vec().clone(), true).await;
             }
         }
+    }
+
+    /// Clean cache
+    #[allow(unsafe_code)]
+    pub async fn clean(&self) {
+        unsafe {
+            self.hashtable.clear();
+            self.watch_id_table.clear();
+        }
+        let mut queue = self.lru_queue.lock().await;
+        queue.clear();
     }
 }

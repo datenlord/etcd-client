@@ -117,13 +117,13 @@ struct MockEtcd {
 
     /// set to store lock name
     lock_map: Arc<RwLock<HashSet<Vec<u8>>>>,
+
+    /// Sequence increasing watch id
+    watch_id_counter: Arc<AtomicI64>,
 }
 
 /// A locked `DuplexSink` for watch response
 type LockedDuplexSink = Arc<Mutex<DuplexSink<WatchResponse>>>;
-
-/// Sequence increasing watch id
-static WATCH_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 /// Range end to get all keys
 const ALL_KEYS: &[u8] = &[0_u8];
@@ -138,6 +138,7 @@ impl MockEtcd {
             watch: Arc::new(RwLock::new(HashMap::new())),
             watch_response_sender: Arc::new(RwLock::new(HashMap::new())),
             lock_map: Arc::new(RwLock::new(HashSet::new())),
+            watch_id_counter: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -339,6 +340,7 @@ impl Watch for MockEtcd {
     ) {
         let watch_arc = Arc::clone(&self.watch);
         let watch_response_sender_arc = Arc::clone(&self.watch_response_sender);
+        let watch_id_arc = Arc::clone(&self.watch_id_counter);
         let task = async move {
             let sink_arc = Arc::new(Mutex::new(sink));
             while let Some(request) = stream.next().await {
@@ -352,7 +354,7 @@ impl Watch for MockEtcd {
                                     .get_range_end()
                                     .to_vec(),
                             };
-                            let watch_id = WATCH_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+                            let watch_id = watch_id_arc.fetch_add(1, Ordering::SeqCst);
                             watch_arc.write().await.insert(watch_id, key_range);
                             watch_response_sender_arc
                                 .write()
@@ -612,9 +614,31 @@ mod test {
     #[test]
     fn test_all() {
         unit_test();
-        e2e_test();
-        e2e_watch_test();
-        e2e_lock_lease_test();
+        let mut etcd_server = MockEtcdServer::new();
+        etcd_server.start();
+        let client = Arc::new(smol::future::block_on(async {
+            let endpoints = vec!["127.0.0.1:2379".to_owned()];
+            let client = Client::connect(ClientConfig {
+                endpoints,
+                auth: None,
+                cache_enable: true,
+                cache_size: 10,
+            })
+            .await
+            .unwrap_or_else(|err| {
+                panic!("failed to connect to etcd server, the error is: {}", err)
+            });
+            client
+        }));
+        e2e_test(&client.clone());
+        e2e_watch_test(&client.clone());
+        e2e_lock_lease_test(&client.clone());
+        smol::future::block_on(async {
+            client
+                .shutdown()
+                .await
+                .unwrap_or_else(|e| panic!("failed to shutdown client, the error is {}", e));
+        });
     }
     fn unit_test() {
         smol::future::block_on(async {
@@ -861,23 +885,8 @@ mod test {
         });
     }
 
-    fn e2e_test() {
-        let mut etcd_server = MockEtcdServer::new();
-        etcd_server.start();
-
+    fn e2e_test(client: &Arc<Client>) {
         smol::future::block_on(async {
-            let endpoints = vec!["127.0.0.1:2379".to_owned()];
-            let client = Client::connect(ClientConfig {
-                endpoints,
-                auth: None,
-                cache_enable: false,
-                cache_size: 0,
-            })
-            .await
-            .unwrap_or_else(|err| {
-                panic!("failed to connect to etcd server, the error is: {}", err)
-            });
-
             let key000 = vec![0_u8, 0_u8, 0_u8];
             let key001 = vec![0_u8, 0_u8, 1_u8];
             let key010 = vec![0_u8, 1_u8, 0_u8];
@@ -1027,23 +1036,8 @@ mod test {
         });
     }
 
-    fn e2e_watch_test() {
-        let mut etcd_server = MockEtcdServer::new();
-        etcd_server.start();
-
+    fn e2e_watch_test(client: &Arc<Client>) {
         smol::future::block_on(async {
-            let endpoints = vec!["127.0.0.1:2379".to_owned()];
-            let client = Client::connect(ClientConfig {
-                endpoints,
-                auth: None,
-                cache_enable: false,
-                cache_size: 0,
-            })
-            .await
-            .unwrap_or_else(|err| {
-                panic!("failed to connect to etcd server, the error is: {}", err)
-            });
-
             let key000 = vec![0_u8, 0_u8, 0_u8];
             let key001 = vec![0_u8, 0_u8, 1_u8];
             let key100 = vec![1_u8, 0_u8, 0_u8];
@@ -1062,6 +1056,18 @@ mod test {
                 .watch(KeyRange::range(key000.clone(), key100.clone()))
                 .await;
 
+            let watch_id = 8; // 0-7 is used by e2e_test()
+            if let Some(resp) = resp_receiver.next().await {
+                assert_eq!(
+                    resp.unwrap_or_else(|e| panic!(
+                        "Fail to get watch response, the error is {}",
+                        e
+                    ))
+                    .watch_id(),
+                    watch_id
+                );
+            }
+
             for key in test_data {
                 client
                     .kv()
@@ -1079,22 +1085,12 @@ mod test {
                 .unwrap_or_else(|err| panic!("failed to delete key 000, the error is {}", err));
             assert_eq!(resp.take_prev_kvs().get(0).unwrap().value(), key000);
 
-            if let Some(resp) = resp_receiver.next().await {
-                assert_eq!(
-                    resp.unwrap_or_else(|e| panic!(
-                        "Fail to get watch response, the error is {}",
-                        e
-                    ))
-                    .watch_id(),
-                    0
-                );
-            }
             for _x in 0..3 {
                 if let Some(resp) = resp_receiver.next().await {
                     let mut watch_resp = resp.unwrap_or_else(|e| {
                         panic!("Fail to get watch response, the error is {}", e)
                     });
-                    assert_eq!(watch_resp.watch_id(), 0);
+                    assert_eq!(watch_resp.watch_id(), watch_id);
                     let mut events = watch_resp.take_events();
                     let event = events
                         .get_mut(0)
@@ -1110,23 +1106,8 @@ mod test {
         });
     }
 
-    fn e2e_lock_lease_test() {
-        let mut etcd_server = MockEtcdServer::new();
-        etcd_server.start();
-
+    fn e2e_lock_lease_test(client: &Arc<Client>) {
         smol::future::block_on(async {
-            let endpoints = vec!["127.0.0.1:2379".to_owned()];
-            let client = Client::connect(ClientConfig {
-                endpoints,
-                auth: None,
-                cache_enable: false,
-                cache_size: 0,
-            })
-            .await
-            .unwrap_or_else(|err| {
-                panic!("failed to connect to etcd server, the error is: {}", err)
-            });
-
             let lock_key012 = vec![0_u8, 1_u8, 2_u8];
 
             let mut res = client

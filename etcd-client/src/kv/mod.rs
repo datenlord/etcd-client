@@ -29,27 +29,34 @@ use crate::INITIAL_INTERVAL_ENV_KEY;
 use crate::INITIAL_INTERVAL_VALUE;
 use crate::MAX_ELAPSED_TIME_ENV_KEY;
 use crate::MAX_ELAPSED_TIME_VALUE;
+use async_trait::async_trait;
 use backoff::ExponentialBackoff;
+use futures::future::FutureExt;
 use futures::stream::StreamExt;
 use grpcio::WriteFlags;
 use log::warn;
 use protobuf::RepeatedField;
 use smol::channel::{bounded, unbounded, Sender};
+use smol::lock::RwLock;
 use std::str;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::lazy::{Lazy, Shutdown};
 use crate::protos::kv::KeyValue;
-use crate::EtcdError;
 use crate::Result as Res;
 use futures::SinkExt;
 use utilities::Cast;
 
 /// Key-Value client.
+#[derive(Clone)]
 pub struct Kv {
+    /// Inner data
+    inner: Arc<Lazy<Arc<KvInner>>>,
+}
+
+/// Key-Value client inner data.
+struct KvInner {
     /// Etcd Key-Value client.
     client: KvClient,
     /// Etcd client cache.
@@ -58,18 +65,21 @@ pub struct Kv {
     cache_enable: bool,
     /// Etcd watch request sender.
     watch_sender: Sender<EtcdWatchRequest>,
-    /// Flag to indicate if the cache is error and disabled
-    cache_err: AtomicBool,
+    /// Read write lock to indicate the availability of the cache.
+    /// When the cache has error, write lock is acquired to disable the cache and clean the cache.
+    /// Other operations will get read lock.
+    cache_availability: RwLock<()>,
+    /// A channel sender to send shutdown request.
+    shutdown: Sender<()>,
 }
 
 /// Etcd client cache default size.
 const ETCD_CACHE_DEFAULT_SIZE: usize = 64;
-
-impl Kv {
-    /// Creates a new `KvClient`.
-    ///
-    /// This method should only be called within etcd client.
-    pub(crate) fn new(
+impl KvInner {
+    /// Create `KvInner`
+    #[allow(clippy::mut_mut)]
+    #[allow(clippy::too_many_lines)] // make no sense to split new()
+    fn new(
         client: KvClient,
         watch_client: &WatchClient,
         cache_size: usize,
@@ -83,6 +93,8 @@ impl Kv {
 
         let (watch_req_sender, watch_req_receiver) = unbounded::<EtcdWatchRequest>();
         let (watch_id_sender, watch_id_receiver) = bounded::<i64>(1);
+        let (shutdown_tx, shutdown_rx) = unbounded();
+        let shutdown_response = shutdown_rx.clone();
 
         let cache = Cache::new(etcd_cache_size, watch_req_sender.clone());
         let (mut client_req_sender, mut client_resp_receiver) = watch_client
@@ -97,7 +109,8 @@ impl Kv {
             cache,
             cache_enable,
             watch_sender: watch_req_sender,
-            cache_err: AtomicBool::from(false),
+            cache_availability: RwLock::new(()),
+            shutdown: shutdown_tx,
         });
 
         let this_clone = Arc::<Self>::clone(&this);
@@ -106,22 +119,25 @@ impl Kv {
         if cache_enable {
             // Task that handles all the pending watch requests.
             smol::spawn(async move {
+                let mut shutdown_rx = shutdown_rx.into_future().fuse();
                 while let Ok(watch_req) = watch_req_receiver.recv().await {
                     let processing_key = watch_req.get_key();
-                    if let Err(e) = client_req_sender
-                        .send((watch_req.clone().into(), WriteFlags::default()))
-                        .await
-                    {
-                        warn!("Fail to send watch request, the error is: {}", e);
-                        this_clone.cache_err.store(true, Ordering::Release);
-                        break;
-                    }
+                    futures::select! {
+                        res = client_req_sender.send((watch_req.clone().into(), WriteFlags::default())).fuse() => {
+                            if let Err(e) = res {
+                                warn!("Fail to send watch request, the error is: {}, clean cache", e);
+                                this_clone.clean_cache().await;
+                                continue;
+                            }
+                        },
+                        _ = shutdown_rx => return
+                    };
                     // Wait until etcd server returns watch id.
                     let watch_id = match watch_id_receiver.recv().await {
                         Err(e) => {
-                            warn!("Fail to receive watch id from channel, the error is {}", e);
-                            this_clone.cache_err.store(true, Ordering::Release);
-                            break;
+                            warn!("Fail to receive watch id from channel, the error is {}, clean cache", e);
+                            this_clone.clean_cache().await;
+                            continue;
                         }
                         Ok(id) => id,
                     };
@@ -137,15 +153,27 @@ impl Kv {
 
             // Task that handle the watch responses from Etcd server.
             smol::spawn(async move {
-                while let Some(watch_resp) = client_resp_receiver.next().await {
+                let mut shutdown_rx = shutdown_response.into_future().fuse();
+                loop {
+                    let watch_resp = futures::select! {
+                        resp_opt = client_resp_receiver.next().fuse() => {
+                            if let Some(resp) = resp_opt {
+                                resp
+                            } else {
+                                break;
+                            }
+                        },
+                        _ = shutdown_rx => return
+                    };
+
                     match watch_resp {
                         Ok(resp) => {
                             // TODO: Check if need to spawn new task here.
                             if resp.get_created() || resp.get_canceled() {
                                 if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
-                                    warn!("Fail to send watch id, the error is {}", e);
-                                    this_clone2.cache_err.store(true, Ordering::Release);
-                                    break;
+                                    warn!("Fail to send watch id, the error is {}, clean cache", e);
+                                    this_clone2.clean_cache().await;
+                                    continue;
                                 }
                             } else {
                                 let events = resp.get_events().to_vec();
@@ -175,17 +203,54 @@ impl Kv {
                             }
                         }
                         Err(e) => {
-                            warn!("Watch response contains error, the error is: {}", e);
-                            this_clone2.cache_err.store(true, Ordering::Release);
-                            break;
+                            warn!(
+                                "Watch response contains error, the error is: {}, clean cache",
+                                e
+                            );
+                            this_clone2.clean_cache().await;
+                            continue;
                         }
                     }
                 }
             })
             .detach();
         };
-
         this
+    }
+    /// Clean cache
+    #[inline]
+    async fn clean_cache(&self) {
+        self.cache_availability.write().await;
+        self.cache.clean().await;
+    }
+}
+
+#[async_trait]
+impl Shutdown for Arc<KvInner> {
+    async fn shutdown(&mut self) -> Res<()> {
+        if self.cache_enable {
+            self.shutdown.send(()).await?;
+            self.shutdown.close();
+        }
+        Ok(())
+    }
+}
+
+impl Kv {
+    /// Creates a new `KvClient`.
+    ///
+    /// This method should only be called within etcd client.
+    pub(crate) fn new(
+        client: KvClient,
+        watch_client: WatchClient,
+        cache_size: usize,
+        cache_enable: bool,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Lazy::new(move || {
+                KvInner::new(client.clone(), &watch_client, cache_size, cache_enable)
+            })),
+        }
     }
 
     /// Performs a key-value saving operation.
@@ -195,26 +260,32 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn put(&self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
-        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
-            return Err(EtcdError::InternalError("Kv cache meets an error".into()));
-        }
-
+        let inner = self.inner.write().await;
         let key = req.get_key();
         let resp: EtcdPutResponse = retryable!(|| async {
-            let resp = self.client.put_async(&req.clone().into())?;
+            let resp = inner.client.put_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
 
-        if self.cache_enable && self.cache.search(key.clone()).await == None {
-            let revision = resp.get_revision();
-            // Creates a new watch request and adds to the send queue.
-            let mut watch_request = EtcdWatchRequest::create(KeyRange::key(key));
-            watch_request.set_start_revision(revision.cast());
-            if let Err(e) = self.watch_sender.send(watch_request).await {
-                warn!("Fail to send watch request, the error is {}", e);
-                self.cache_err.store(true, Ordering::Release);
+        if inner.cache_enable {
+            if let Some(cache_lock) = inner.cache_availability.try_read() {
+                if inner.cache.search(key.clone()).await == None {
+                    let revision = resp.get_revision();
+                    // Creates a new watch request and adds to the send queue.
+                    let mut watch_request = EtcdWatchRequest::create(KeyRange::key(key));
+                    watch_request.set_start_revision(revision.cast());
+                    if let Err(e) = inner.watch_sender.send(watch_request).await {
+                        warn!(
+                            "Fail to send watch request, the error is {}, clean cache",
+                            e
+                        );
+                        drop(cache_lock);
+                        inner.clean_cache().await;
+                    }
+                }
             }
         }
+
         Ok(resp)
     }
 
@@ -225,11 +296,9 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn get(&self, req: EtcdGetRequest) -> Res<EtcdGetResponse> {
-        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
-            return Err(EtcdError::InternalError("Kv cache meets an error".into()));
-        }
-        if self.cache_enable {
-            if let Some(value) = self.cache.search(req.get_key()).await {
+        let inner = self.inner.read().await;
+        if inner.cache_enable && inner.cache_availability.try_read().is_some() {
+            if let Some(value) = inner.cache.search(req.get_key()).await {
                 let mut response = RangeResponse::new();
                 response.set_count(1);
                 response.set_kvs(RepeatedField::from_vec(vec![value]));
@@ -238,22 +307,28 @@ impl Kv {
         }
 
         let resp = retryable!(|| async {
-            let resp = self.client.range_async(&req.clone().into())?;
+            let resp = inner.client.range_async(&req.clone().into())?;
             Ok(resp.await?)
         });
-        if self.cache_enable {
-            let kvs = resp.get_kvs();
-            for kv in kvs {
-                if self.cache.search(kv.get_key().to_vec()).await == None {
-                    // Creates a new watch request and adds to the send queue.
-                    let watch_request = EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
-                    if let Err(e) = self.watch_sender.send(watch_request).await {
-                        warn!("Fail to send watch request, the error is {}", e);
-                        self.cache_err.store(true, Ordering::Release);
-                        break;
+        if inner.cache_enable {
+            if let Some(cache_lock) = inner.cache_availability.try_read() {
+                let kvs = resp.get_kvs();
+                for kv in kvs {
+                    if inner.cache.search(kv.get_key().to_vec()).await == None {
+                        // Creates a new watch request and adds to the send queue.
+                        let watch_request = EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
+                        if let Err(e) = inner.watch_sender.send(watch_request).await {
+                            warn!(
+                                "Fail to send watch request, the error is {}, clean cache",
+                                e
+                            );
+                            drop(cache_lock);
+                            inner.clean_cache().await;
+                            break;
+                        }
                     }
+                    inner.cache.insert(kv.get_key().to_vec(), kv.clone()).await;
                 }
-                self.cache.insert(kv.get_key().to_vec(), kv.clone()).await;
             }
         }
         Ok(From::from(resp))
@@ -266,11 +341,9 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn range(&self, req: EtcdRangeRequest) -> Res<EtcdRangeResponse> {
-        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
-            return Err(EtcdError::InternalError("Kv cache meets an error".into()));
-        }
+        let inner = self.inner.read().await;
         let resp = retryable!(|| async {
-            let resp = self.client.range_async(&req.clone().into())?;
+            let resp = inner.client.range_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
         Ok(resp)
@@ -283,11 +356,9 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn delete(&self, req: EtcdDeleteRequest) -> Res<EtcdDeleteResponse> {
-        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
-            return Err(EtcdError::InternalError("Kv cache meets an error".into()));
-        }
+        let inner = self.inner.read().await;
         let resp = retryable!(|| async {
-            let resp = self.client.delete_range_async(&req.clone().into())?;
+            let resp = inner.client.delete_range_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
         Ok(resp)
@@ -300,14 +371,22 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn txn(&self, req: EtcdTxnRequest) -> Res<EtcdTxnResponse> {
-        if self.cache_enable && self.cache_err.load(Ordering::Acquire) {
-            return Err(EtcdError::InternalError("Kv cache meets an error".into()));
-        }
+        let inner = self.inner.read().await;
         let resp = retryable!(|| async {
-            let resp = self.client.txn_async(&req.clone().into())?;
+            let resp = inner.client.txn_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
         Ok(resp)
+    }
+
+    /// Shut down the running watch task, if any.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if kv is shutdown.
+    #[inline]
+    pub async fn shutdown(&self) -> Res<()> {
+        self.inner.evict().await
     }
 }
 
