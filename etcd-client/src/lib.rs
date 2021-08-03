@@ -205,6 +205,7 @@ async fn sleep(d: Duration) {
 mod tests {
     use super::*;
     use async_compat::Compat;
+    use futures::StreamExt;
     use std::collections::HashMap;
     use std::time::Duration;
     use std::time::SystemTime;
@@ -220,8 +221,57 @@ mod tests {
             test_kv().await?;
             test_transaction().await?;
             test_lock().await?;
+            test_watch().await?;
             Ok(())
         }))
+    }
+
+    async fn test_watch() -> Result<()> {
+        let client = build_etcd_client().await?;
+
+        client
+            .kv()
+            .put(EtcdPutRequest::new("41_foo1", "baz1"))
+            .await?;
+        client
+            .kv()
+            .put(EtcdPutRequest::new("42_foo1", "baz2"))
+            .await?;
+
+        let watch_key = "41_foo1";
+        let mut response = client.watch(KeyRange::key(watch_key)).await;
+        assert_eq!(
+            response
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("Fail to receive reponse from client"))
+                .unwrap_or_else(|e| { panic!("failed to get watch response, the error is: {}", e) })
+                .watch_id(),
+            0,
+            "Receive wrong watch response from etcd server"
+        );
+
+        client
+            .kv()
+            .put(EtcdPutRequest::new("41_foo1", "baz3"))
+            .await?;
+        let mut watch_response = response
+            .next()
+            .await
+            .unwrap_or_else(|| panic!("Fail to receive reponse from client"))
+            .unwrap_or_else(|e| panic!("failed to get watch response, the error is: {}", e));
+
+        assert_eq!(
+            watch_response.watch_id(),
+            0,
+            "Receive wrong watch response from etcd server"
+        );
+        assert_eq!(
+            watch_response.take_events().len(),
+            1,
+            "Receive wrong watch events from etcd server"
+        );
+        Ok(())
     }
 
     async fn test_lock() -> Result<()> {
