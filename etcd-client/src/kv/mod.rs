@@ -37,9 +37,11 @@ use grpcio::WriteFlags;
 use log::warn;
 use protobuf::RepeatedField;
 use smol::channel::{bounded, unbounded, Sender};
-use smol::lock::RwLock;
 use std::str;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use crate::lazy::{Lazy, Shutdown};
@@ -65,10 +67,8 @@ struct KvInner {
     cache_enable: bool,
     /// Etcd watch request sender.
     watch_sender: Sender<EtcdWatchRequest>,
-    /// Read write lock to indicate the availability of the cache.
-    /// When the cache has error, write lock is acquired to disable the cache and clean the cache.
-    /// Other operations will get read lock.
-    cache_availability: RwLock<()>,
+    /// Flag to indicate cache is available or not
+    cache_availability: AtomicBool,
     /// A channel sender to send shutdown request.
     shutdown: Sender<()>,
 }
@@ -109,7 +109,7 @@ impl KvInner {
             cache,
             cache_enable,
             watch_sender: watch_req_sender,
-            cache_availability: RwLock::new(()),
+            cache_availability: AtomicBool::from(true),
             shutdown: shutdown_tx,
         });
 
@@ -175,31 +175,45 @@ impl KvInner {
                                     this_clone2.clean_cache().await;
                                     continue;
                                 }
-                            } else {
+                            } else if this_clone2.cache_availability.load(Ordering::Acquire) {
                                 let events = resp.get_events().to_vec();
                                 for event in events {
                                     if event.get_field_type() == Event_EventType::PUT {
-                                        if let Some(valid_value) = cache_inner
-                                            .search(event.get_kv().get_key().to_vec())
-                                            .await
+                                        let key = event.get_kv().get_key().to_vec();
+                                        if let Some(valid_value) =
+                                            cache_inner.search(key.clone()).await
                                         {
                                             // Only update the cache if event's version is larger than
                                             // existing value's version
                                             if valid_value.version < event.get_kv().get_version() {
                                                 cache_inner
-                                                    .insert(
-                                                        event.get_kv().get_key().to_vec(),
-                                                        event.get_kv().clone(),
-                                                    )
+                                                    .insert(key, event.get_kv().clone())
                                                     .await;
+                                            }
+                                        } else {
+                                            let watch_id = resp.get_watch_id();
+                                            if let Some(current_watch_id) =
+                                                cache_inner.search_watch_id(&key)
+                                            {
+                                                if current_watch_id == watch_id {
+                                                    cache_inner
+                                                        .insert(key, event.get_kv().clone())
+                                                        .await;
+                                                } else {
+                                                    cache_inner.cancel_watch(watch_id).await;
+                                                }
+                                            } else {
+                                                cache_inner
+                                                    .insert(key.clone(), event.get_kv().clone())
+                                                    .await;
+                                                cache_inner.insert_watch_id(key.clone(), watch_id);
                                             }
                                         }
                                     } else {
-                                        cache_inner
-                                            .delete(event.get_kv().get_key().to_vec(), true)
-                                            .await;
+                                        cache_inner.delete(event.get_kv().get_key().to_vec()).await;
                                     }
                                 }
+                            } else {
                             }
                         }
                         Err(e) => {
@@ -220,8 +234,9 @@ impl KvInner {
     /// Clean cache
     #[inline]
     async fn clean_cache(&self) {
-        self.cache_availability.write().await;
+        self.cache_availability.store(false, Ordering::Release);
         self.cache.clean().await;
+        self.cache_availability.store(true, Ordering::Release);
     }
 }
 
@@ -260,31 +275,25 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn put(&self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
-        let inner = self.inner.write().await;
+        let inner = self.inner.read().await;
         let key = req.get_key();
+        if inner.cache_enable
+            && inner.cache_availability.load(Ordering::Acquire)
+            && inner.cache.search_watch_id(&key) == None
+        {
+            let watch_request = EtcdWatchRequest::create(KeyRange::key(key));
+            if let Err(e) = inner.watch_sender.send(watch_request).await {
+                warn!(
+                    "Fail to send watch request, the error is {}, clean cache",
+                    e
+                );
+                inner.clean_cache().await;
+            }
+        }
         let resp: EtcdPutResponse = retryable!(|| async {
             let resp = inner.client.put_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
-
-        if inner.cache_enable {
-            if let Some(cache_lock) = inner.cache_availability.try_read() {
-                if inner.cache.search(key.clone()).await == None {
-                    let revision = resp.get_revision();
-                    // Creates a new watch request and adds to the send queue.
-                    let mut watch_request = EtcdWatchRequest::create(KeyRange::key(key));
-                    watch_request.set_start_revision(revision.cast());
-                    if let Err(e) = inner.watch_sender.send(watch_request).await {
-                        warn!(
-                            "Fail to send watch request, the error is {}, clean cache",
-                            e
-                        );
-                        drop(cache_lock);
-                        inner.clean_cache().await;
-                    }
-                }
-            }
-        }
 
         Ok(resp)
     }
@@ -297,8 +306,24 @@ impl Kv {
     #[inline]
     pub async fn get(&self, req: EtcdGetRequest) -> Res<EtcdGetResponse> {
         let inner = self.inner.read().await;
-        if inner.cache_enable && inner.cache_availability.try_read().is_some() {
-            if let Some(value) = inner.cache.search(req.get_key()).await {
+
+        let key = req.get_key();
+        if inner.cache_enable
+            && inner.cache_availability.load(Ordering::Acquire)
+            && inner.cache.search_watch_id(&key) == None
+        {
+            let watch_request = EtcdWatchRequest::create(KeyRange::key(key.clone()));
+            if let Err(e) = inner.watch_sender.send(watch_request).await {
+                warn!(
+                    "Fail to send watch request, the error is {}, clean cache",
+                    e
+                );
+                inner.clean_cache().await;
+            }
+        }
+
+        if inner.cache_enable && inner.cache_availability.load(Ordering::Acquire) {
+            if let Some(value) = inner.cache.search(key).await {
                 let mut response = RangeResponse::new();
                 response.set_count(1);
                 response.set_kvs(RepeatedField::from_vec(vec![value]));
@@ -310,27 +335,6 @@ impl Kv {
             let resp = inner.client.range_async(&req.clone().into())?;
             Ok(resp.await?)
         });
-        if inner.cache_enable {
-            if let Some(cache_lock) = inner.cache_availability.try_read() {
-                let kvs = resp.get_kvs();
-                for kv in kvs {
-                    if inner.cache.search(kv.get_key().to_vec()).await == None {
-                        // Creates a new watch request and adds to the send queue.
-                        let watch_request = EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
-                        if let Err(e) = inner.watch_sender.send(watch_request).await {
-                            warn!(
-                                "Fail to send watch request, the error is {}, clean cache",
-                                e
-                            );
-                            drop(cache_lock);
-                            inner.clean_cache().await;
-                            break;
-                        }
-                    }
-                    inner.cache.insert(kv.get_key().to_vec(), kv.clone()).await;
-                }
-            }
-        }
         Ok(From::from(resp))
     }
 

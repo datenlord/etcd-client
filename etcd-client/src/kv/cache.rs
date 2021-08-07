@@ -49,30 +49,32 @@ impl Cache {
         }
     }
 
-    /// Inserts a `key` from the cache.
+    /// Inserts a `key` to the cache.
     pub async fn insert(&self, key: Vec<u8>, value: KeyValue) {
+        // Don't change insert sequence
         self.hashtable.insert(key.clone(), value);
         self.lru_queue.lock().await.push(key, Self::get_priority());
         self.adjust_cache_size().await;
     }
 
-    /// Deletes a `key` from the cache.
-    pub async fn delete(&self, key: Vec<u8>, cancel_watch: bool) {
-        if cancel_watch {
-            let watch_id = self
-                .search_watch_id(&key.clone())
-                .unwrap_or_else(|| panic!("Fail to get watch id for a key"));
-            // Remove watch for this key.
-            self.watch_sender
-                .send(EtcdWatchRequest::cancel(watch_id.cast()))
-                .await
-                .unwrap_or_else(|e| panic!("Fail to send watch request, the error is {}", e));
-        } else {
-            self.delete_watch_id(&key);
-        }
+    /// Cancel watch of a watch id
+    pub async fn cancel_watch(&self, watch_id: i64) {
+        self.watch_sender
+            .send(EtcdWatchRequest::cancel(watch_id.cast()))
+            .await
+            .unwrap_or_else(|e| panic!("Fail to send watch request, the error is {}", e));
+    }
 
-        self.hashtable.remove(&key);
+    /// Deletes a `key` from the cache.
+    pub async fn delete(&self, key: Vec<u8>) {
+        let watch_id = self
+            .search_watch_id(&key)
+            .unwrap_or_else(|| panic!("Fail to get watch id for key={:?}", key));
+        self.cancel_watch(watch_id).await;
+
+        // Don't change delete sequence
         self.lru_queue.lock().await.remove(&key);
+        self.hashtable.remove(&key);
     }
 
     /// Deletes a watch id from the cache.
@@ -110,7 +112,7 @@ impl Cache {
         if self.hashtable.size() > self.hashtable.capacity().overflow_mul(6).overflow_div(10) {
             let queue = self.lru_queue.lock().await;
             if let Some(pop_value) = queue.peek() {
-                self.delete(pop_value.0.to_vec().clone(), true).await;
+                self.delete(pop_value.0.to_vec().clone()).await;
             }
         }
     }
@@ -118,11 +120,20 @@ impl Cache {
     /// Clean cache
     #[allow(unsafe_code)]
     pub async fn clean(&self) {
+        // Don't change clear sequence
+        // Adopt the following sequence to keep consistency between hashtable and lru_queue
+        //
+        // | Sequence         |Sequence          |Sequence          |Sequence          |Sequence          |Sequence          |
+        // | insert hashtable | insert hashtable | clear lru_queue  | insert hashtable | clear lru_queue  | clear lru_queue  |
+        // | insert lru_queue | clear lru_queue  | insert hashtable | clear lru_queue  | insert hashtable | clear hashtable  |
+        // | clear lru_queue  | insert lru_queue | insert lru_queue | clear hashtable  | clear hashtable  | insert hashtable |
+        // | clear hashtable  | clear hashtable  | clear hashtable  | insert lru_queue | insert lru_queue | insert lru_queue |
+        // | Good             | <----------  key in lru_queue not in hashtable, but it is OK  -------->   | Good             |
+        let mut queue = self.lru_queue.lock().await;
+        queue.clear();
         unsafe {
             self.hashtable.clear();
             self.watch_id_table.clear();
         }
-        let mut queue = self.lru_queue.lock().await;
-        queue.clear();
     }
 }

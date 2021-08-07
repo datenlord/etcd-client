@@ -22,7 +22,7 @@ futures = "0.3.5"
 grpcio = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
 http = "0.2"
 log = "0.4.11"
-lockfree-cuckoohash = { git = "https://github.com/datenlord/lockfree-cuckoohash.git", rev = "69ccd5a"}
+lockfree-cuckoohash = { git = "https://github.com/datenlord/lockfree-cuckoohash.git", rev = "402b15c"}
 priority-queue = "1.0.5"
 protobuf = "2.16.2"
 smol = "1.2.4"
