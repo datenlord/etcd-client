@@ -51,8 +51,8 @@ impl EtcdGetRequest {
 
     /// Gets the `key_range` from the `RangeRequest`.
     #[inline]
-    pub fn get_key(&self) -> Vec<u8> {
-        self.proto.get_key().to_vec()
+    pub fn get_key(&self) -> &[u8] {
+        self.proto.get_key()
     }
 }
 
@@ -109,6 +109,13 @@ impl EtcdGetResponse {
     #[inline]
     pub fn get_kvs(&self) -> Vec<EtcdKeyValue> {
         self.proto.kvs.clone().into_iter().map(From::from).collect()
+    }
+
+    /// Consume `EtcdGetRequest` and return inner `RangeResponse`
+    #[allow(clippy::missing_const_for_fn)] // false alarm
+    #[inline]
+    pub fn get_inner(self) -> RangeResponse {
+        self.proto
     }
 }
 

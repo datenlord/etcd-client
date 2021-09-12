@@ -32,6 +32,18 @@ impl EtcdDeleteRequest {
     pub fn set_prev_kv(&mut self, prev_kv: bool) {
         self.proto.prev_kv = prev_kv;
     }
+
+    /// Get key of request
+    #[inline]
+    pub fn get_key(&self) -> &[u8] {
+        self.proto.get_key()
+    }
+
+    /// Get key of request
+    #[inline]
+    pub fn request_prev_kv(&self) -> bool {
+        self.proto.prev_kv
+    }
 }
 
 impl From<EtcdDeleteRequest> for DeleteRangeRequest {
@@ -84,6 +96,12 @@ impl EtcdDeleteResponse {
             .into_iter()
             .map(From::from)
             .collect()
+    }
+
+    /// Get revision of response
+    #[inline]
+    pub fn get_revision(&self) -> i64 {
+        self.proto.get_header().revision
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::kv::WatchRequest;
 use crate::lease::EtcdLeaseKeepAliveRequest;
 use smol::channel::SendError;
 
@@ -17,6 +18,9 @@ pub enum EtcdError {
     /// SendError for EtcdLeaseKeepAliveRequest
     #[error("send error for EtcdLeaseKeepAliveRequest: {0}")]
     SendFailedForLeaseKeepAliveRequest(#[from] SendError<EtcdLeaseKeepAliveRequest>),
+    /// SendError for EtcdWatchRequest
+    #[error("send error for EtcdWatchRequest: {0}")]
+    SendFailedForWatchRequest(#[from] SendError<WatchRequest>),
     /// Internal Error
     #[error("Internal Error: {0}")]
     InternalError(String),
