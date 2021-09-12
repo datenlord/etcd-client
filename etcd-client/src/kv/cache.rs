@@ -2,35 +2,50 @@
 use super::KeyValue;
 use super::OverflowArithmetic;
 use crate::watch::EtcdWatchRequest;
+use crate::Result as Res;
 use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
 use priority_queue::PriorityQueue;
 use smol::channel::Sender;
 use smol::lock::Mutex;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use utilities::Cast;
 
+/// Cache entry
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheEntry {
+    /// watch id related to key
+    watch_id: i64,
+    /// current revision of key in cache
+    revision: i64,
+    /// key value, None means key has been deleted
+    /// but watch is not cancelled yet.
+    kv: Option<KeyValue>,
+}
+
+impl CacheEntry {
+    /// Create a new `CacheEntry`.
+    pub const fn new(kv: Option<KeyValue>, revision: i64, watch_id: i64) -> Self {
+        Self {
+            watch_id,
+            revision,
+            kv,
+        }
+    }
+}
 /// Cache struct contains a lock-free hashTable.
-#[derive(Clone)]
 pub struct Cache {
     /// map to store key value
-    hashtable: Arc<LockFreeCuckooHash<Vec<u8>, KeyValue>>,
+    hashtable: LockFreeCuckooHash<Vec<u8>, CacheEntry>,
     /// lru queue to store the keys in hashtable.
-    lru_queue: Arc<Mutex<PriorityQueue<Vec<u8>, u64>>>,
-    /// map to store key and watch id
-    watch_id_table: Arc<LockFreeCuckooHash<Vec<u8>, i64>>,
-    /// Etcd watch request sender.
-    watch_sender: Sender<EtcdWatchRequest>,
+    lru_queue: Mutex<PriorityQueue<Vec<u8>, u64>>,
 }
 
 impl Cache {
     /// Create a new `Cache` with specified size.
-    pub fn new(size: usize, sender: Sender<EtcdWatchRequest>) -> Self {
+    pub fn new(size: usize) -> Self {
         Self {
-            hashtable: Arc::new(LockFreeCuckooHash::with_capacity(size)),
-            lru_queue: Arc::new(Mutex::new(PriorityQueue::new())),
-            watch_id_table: Arc::new(LockFreeCuckooHash::with_capacity(size)),
-            watch_sender: sender,
+            hashtable: LockFreeCuckooHash::with_capacity(size),
+            lru_queue: Mutex::new(PriorityQueue::new()),
         }
     }
 
@@ -41,57 +56,112 @@ impl Cache {
             self.hashtable.get(&key, &guard).cloned()
         };
         match search_result {
-            Some(value) => {
-                self.lru_queue.lock().await.push(key, Self::get_priority());
-                Some(value.clone())
+            Some(entry) => {
+                if let Some(kv) = entry.kv {
+                    self.lru_queue.lock().await.push(key, Self::get_priority());
+                    Some(kv)
+                } else {
+                    None
+                }
             }
             None => None,
         }
     }
 
-    /// Inserts a `key` from the cache.
-    pub async fn insert(&self, key: Vec<u8>, value: KeyValue) {
-        self.hashtable.insert(key.clone(), value);
-        self.lru_queue.lock().await.push(key, Self::get_priority());
-        self.adjust_cache_size().await;
-    }
-
-    /// Deletes a `key` from the cache.
-    pub async fn delete(&self, key: Vec<u8>, cancel_watch: bool) {
-        if cancel_watch {
-            let watch_id = self
-                .search_watch_id(&key.clone())
-                .unwrap_or_else(|| panic!("Fail to get watch id for a key"));
-            // Remove watch for this key.
-            self.watch_sender
-                .send(EtcdWatchRequest::cancel(watch_id.cast()))
-                .await
-                .unwrap_or_else(|e| panic!("Fail to send watch request, the error is {}", e));
-        } else {
-            self.delete_watch_id(&key);
+    /// Update a `key` to cache
+    pub async fn update(&self, key: Vec<u8>, value: KeyValue, mark_delete: bool) {
+        loop {
+            let value_clone = value.clone();
+            let search_result = {
+                let guard = pin();
+                self.hashtable.get(&key, &guard).cloned()
+            };
+            if let Some(ref entry) = search_result {
+                let revision = value_clone.get_mod_revision();
+                if revision > entry.revision {
+                    if self.hashtable.compare_and_update(
+                        key.clone(),
+                        CacheEntry::new(
+                            if mark_delete { None } else { Some(value_clone) },
+                            revision,
+                            entry.watch_id,
+                        ),
+                        entry,
+                    ) {
+                        self.lru_queue
+                            .lock()
+                            .await
+                            .push(key.clone(), Self::get_priority());
+                        break;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                panic!("key {:?} is deleted during update", key);
+            }
         }
-
-        self.hashtable.remove(&key);
-        self.lru_queue.lock().await.remove(&key);
     }
 
-    /// Deletes a watch id from the cache.
-    pub fn delete_watch_id(&self, key: &[u8]) {
-        self.watch_id_table.remove(&key.to_vec());
+    /// Insert or update a `key` to the cache.
+    pub async fn insert_or_update(&self, key: Vec<u8>, value: KeyValue) {
+        let revision = value.get_mod_revision();
+        if self.hashtable.insert_if_not_exists(
+            key.clone(),
+            CacheEntry::new(Some(value.clone()), revision, -1),
+        ) {
+            self.lru_queue
+                .lock()
+                .await
+                .push(key.clone(), Self::get_priority());
+        } else {
+            self.update(key, value, false).await;
+        }
     }
 
-    /// Inserts a watch id to the cache.
-    pub fn insert_watch_id(&self, key: Vec<u8>, value: i64) {
-        self.watch_id_table.insert(key, value);
+    /// Remove a `key` from cache totally
+    pub async fn remove(&self, key: &[u8]) {
+        self.hashtable.remove(key);
+        self.lru_queue.lock().await.remove(key);
     }
 
-    /// Searches a watch id for a specific key.
-    pub fn search_watch_id(&self, key: &[u8]) -> Option<i64> {
-        let guard = pin();
-        let search_result = self.watch_id_table.get(&key.to_vec(), &guard);
-        match search_result {
-            Some(value) => Some(*value),
-            None => None,
+    /// Mark a `key` as delete.
+    pub async fn mark_delete(&self, key: Vec<u8>, value: KeyValue) {
+        let search_result = {
+            let guard = pin();
+            self.hashtable.get(&key, &guard).cloned()
+        };
+        if search_result.is_some() {
+            self.update(key, value, true).await;
+        }
+    }
+
+    /// Update watch id of a `key`
+    pub async fn update_watch_id(&self, key: Vec<u8>, watch_id: i64) {
+        loop {
+            let search_result = {
+                let guard = pin();
+                self.hashtable.get(&key, &guard).cloned()
+            };
+            if let Some(ref entry) = search_result {
+                if self.hashtable.compare_and_update(
+                    key.clone(),
+                    CacheEntry::new(entry.kv.clone(), entry.revision, watch_id),
+                    entry,
+                ) {
+                    self.lru_queue
+                        .lock()
+                        .await
+                        .push(key.clone(), Self::get_priority());
+                    break;
+                } else {
+                    continue;
+                }
+            } else {
+                panic!("key {:?} is deleted during update", key);
+            }
         }
     }
 
@@ -105,14 +175,33 @@ impl Cache {
         u64::MAX.overflow_sub(since_the_epoch.as_secs())
     }
 
-    /// Adjusts cache size if the number of value in cache has exceed the threshold(0.6).
-    async fn adjust_cache_size(&self) {
-        if self.hashtable.size() > self.hashtable.capacity().overflow_mul(6).overflow_div(10) {
-            let queue = self.lru_queue.lock().await;
-            if let Some(pop_value) = queue.peek() {
-                self.delete(pop_value.0.to_vec().clone(), true).await;
+    /// Adjusts cache size if the number of value in cache has exceed the threshold(0.8 * capacity).
+    /// Adjusts cache to 0.6 * capacity
+    pub async fn adjust_cache_size(&self, watch_sender: &Sender<EtcdWatchRequest>) -> Res<()> {
+        if self.hashtable.size() > self.hashtable.capacity().overflow_mul(8).overflow_div(10) {
+            let mut queue = self.lru_queue.lock().await;
+            while self.hashtable.size() > self.hashtable.capacity().overflow_mul(6).overflow_div(10)
+            {
+                if let Some(pop_value) = queue.pop() {
+                    let key = pop_value.0;
+                    let search_result = {
+                        let guard = pin();
+                        self.hashtable.get(&key, &guard).cloned()
+                    };
+                    if let Some(value) = search_result {
+                        self.hashtable.remove(&key);
+                        watch_sender
+                            .send(EtcdWatchRequest::cancel(value.watch_id.cast()))
+                            .await?;
+                    } else {
+                        panic!("lru cache doesn't match hashmap key is {:?}", key);
+                    }
+                } else {
+                    panic!("lru cache size is less than hashmap size");
+                }
             }
         }
+        Ok(())
     }
 
     /// Clean cache
@@ -120,7 +209,6 @@ impl Cache {
     pub async fn clean(&self) {
         unsafe {
             self.hashtable.clear();
-            self.watch_id_table.clear();
         }
         let mut queue = self.lru_queue.lock().await;
         queue.clear();

@@ -11,6 +11,7 @@ mod range;
 mod txn;
 
 pub use super::watch::{EtcdWatchRequest, EtcdWatchResponse};
+use async_std::channel::Receiver;
 pub use cache::Cache;
 pub use delete::{EtcdDeleteRequest, EtcdDeleteResponse};
 pub use get::{EtcdGetRequest, EtcdGetResponse};
@@ -29,7 +30,7 @@ use crate::INITIAL_INTERVAL_ENV_KEY;
 use crate::INITIAL_INTERVAL_VALUE;
 use crate::MAX_ELAPSED_TIME_ENV_KEY;
 use crate::MAX_ELAPSED_TIME_VALUE;
-use async_trait::async_trait;
+use atomic_refcell::AtomicRefCell;
 use backoff::ExponentialBackoff;
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
@@ -42,7 +43,6 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::lazy::{Lazy, Shutdown};
 use crate::protos::kv::KeyValue;
 use crate::Result as Res;
 use futures::SinkExt;
@@ -52,36 +52,40 @@ use utilities::Cast;
 #[derive(Clone)]
 pub struct Kv {
     /// Inner data
-    inner: Arc<Lazy<Arc<KvInner>>>,
+    inner: Arc<KvInner>,
 }
 
-/// Key-Value client inner data.
-struct KvInner {
+/// Inner data of Kv
+pub struct KvInner {
     /// Etcd Key-Value client.
     client: KvClient,
     /// Etcd client cache.
-    cache: Cache,
+    cache: Arc<Cache>,
     /// Enable etcd client cache.
     cache_enable: bool,
     /// Etcd watch request sender.
-    watch_sender: Sender<EtcdWatchRequest>,
-    /// Read write lock to indicate the availability of the cache.
+    watch_sender: AtomicRefCell<Sender<EtcdWatchRequest>>,
+    /// Read write lock to access cache
     /// When the cache has error, write lock is acquired to disable the cache and clean the cache.
     /// Other operations will get read lock.
-    cache_availability: RwLock<()>,
+    cache_lock: RwLock<()>,
     /// A channel sender to send shutdown request.
-    shutdown: Sender<()>,
+    shutdown_task1: AtomicRefCell<Sender<()>>,
+    /// A channel sender to send shutdown request.
+    shutdown_task2: AtomicRefCell<Sender<()>>,
+    /// Watch Client
+    watch_client: WatchClient,
 }
 
 /// Etcd client cache default size.
 const ETCD_CACHE_DEFAULT_SIZE: usize = 64;
 impl KvInner {
-    /// Create `KvInner`
-    #[allow(clippy::mut_mut)]
-    #[allow(clippy::too_many_lines)] // make no sense to split new()
-    fn new(
+    /// Creates a new `KvClient`.
+    ///
+    /// This method should only be called within etcd client.
+    pub fn new(
         client: KvClient,
-        watch_client: &WatchClient,
+        watch_client: WatchClient,
         cache_size: usize,
         cache_enable: bool,
     ) -> Arc<Self> {
@@ -91,151 +95,207 @@ impl KvInner {
             cache_size
         };
 
+        let cache = Arc::new(Cache::new(etcd_cache_size));
         let (watch_req_sender, watch_req_receiver) = unbounded::<EtcdWatchRequest>();
-        let (watch_id_sender, watch_id_receiver) = bounded::<i64>(1);
-        let (shutdown_tx, shutdown_rx) = unbounded();
-        let shutdown_response = shutdown_rx.clone();
+        let (shutdown_tx1, shutdown_rx_1) = unbounded();
+        let (shutdown_tx2, shutdown_rx_2) = unbounded();
 
-        let cache = Cache::new(etcd_cache_size, watch_req_sender.clone());
-        let (mut client_req_sender, mut client_resp_receiver) = watch_client
-            .watch()
-            .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
-
-        let cache_clone = cache.clone();
-        let cache_inner = cache.clone();
-
+        let cache_clone = Arc::<Cache>::clone(&cache);
+        let watch_client_clone = watch_client.clone();
         let this = Arc::new(Self {
             client,
             cache,
             cache_enable,
-            watch_sender: watch_req_sender,
-            cache_availability: RwLock::new(()),
-            shutdown: shutdown_tx,
+            watch_sender: AtomicRefCell::new(watch_req_sender),
+            cache_lock: RwLock::new(()),
+            shutdown_task1: AtomicRefCell::new(shutdown_tx1),
+            shutdown_task2: AtomicRefCell::new(shutdown_tx2),
+            watch_client,
         });
 
-        let this_clone = Arc::<Self>::clone(&this);
-        let this_clone2 = Arc::<Self>::clone(&this);
-
         if cache_enable {
-            // Task that handles all the pending watch requests.
-            smol::spawn(async move {
-                let mut shutdown_rx = shutdown_rx.into_future().fuse();
-                while let Ok(watch_req) = watch_req_receiver.recv().await {
-                    let processing_key = watch_req.get_key();
-                    futures::select! {
-                        res = client_req_sender.send((watch_req.clone().into(), WriteFlags::default())).fuse() => {
-                            if let Err(e) = res {
-                                warn!("Fail to send watch request, the error is: {}, clean cache", e);
-                                this_clone.clean_cache().await;
-                                continue;
-                            }
-                        },
-                        _ = shutdown_rx => return
-                    };
-                    // Wait until etcd server returns watch id.
-                    let watch_id = match watch_id_receiver.recv().await {
-                        Err(e) => {
-                            warn!("Fail to receive watch id from channel, the error is {}, clean cache", e);
-                            this_clone.clean_cache().await;
-                            continue;
-                        }
-                        Ok(id) => id,
-                    };
-                    // Watch request can only be create or cancel.
-                    if watch_req.is_create() {
-                        cache_clone.insert_watch_id(processing_key.clone(), watch_id);
-                    } else {
-                        cache_clone.delete_watch_id(&processing_key);
-                    }
-                }
-            })
-            .detach();
-
-            // Task that handle the watch responses from Etcd server.
-            smol::spawn(async move {
-                let mut shutdown_rx = shutdown_response.into_future().fuse();
-                loop {
-                    let watch_resp = futures::select! {
-                        resp_opt = client_resp_receiver.next().fuse() => {
-                            if let Some(resp) = resp_opt {
-                                resp
-                            } else {
-                                break;
-                            }
-                        },
-                        _ = shutdown_rx => return
-                    };
-
-                    match watch_resp {
-                        Ok(resp) => {
-                            // TODO: Check if need to spawn new task here.
-                            if resp.get_created() || resp.get_canceled() {
-                                if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
-                                    warn!("Fail to send watch id, the error is {}, clean cache", e);
-                                    this_clone2.clean_cache().await;
-                                    continue;
-                                }
-                            } else {
-                                let events = resp.get_events().to_vec();
-                                for event in events {
-                                    if event.get_field_type() == Event_EventType::PUT {
-                                        if let Some(valid_value) = cache_inner
-                                            .search(event.get_kv().get_key().to_vec())
-                                            .await
-                                        {
-                                            // Only update the cache if event's version is larger than
-                                            // existing value's version
-                                            if valid_value.version < event.get_kv().get_version() {
-                                                cache_inner
-                                                    .insert(
-                                                        event.get_kv().get_key().to_vec(),
-                                                        event.get_kv().clone(),
-                                                    )
-                                                    .await;
-                                            }
-                                        }
-                                    } else {
-                                        cache_inner
-                                            .delete(event.get_kv().get_key().to_vec(), true)
-                                            .await;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Watch response contains error, the error is: {}, clean cache",
-                                e
-                            );
-                            this_clone2.clean_cache().await;
-                            continue;
-                        }
-                    }
-                }
-            })
-            .detach();
+            Self::start_watch_task(
+                Arc::<Self>::clone(&this),
+                cache_clone,
+                shutdown_rx_1,
+                shutdown_rx_2,
+                watch_req_receiver,
+                &watch_client_clone,
+            )
         };
         this
     }
+
+    /// Start async watch task
+    #[allow(clippy::mut_mut)]
+    #[allow(clippy::too_many_lines)]
+    fn start_watch_task(
+        this_clone: Arc<Self>,
+        cache_clone: Arc<Cache>,
+        shutdown_rx_1: Receiver<()>,
+        shutdown_rx_2: Receiver<()>,
+        watch_req_receiver: Receiver<EtcdWatchRequest>,
+        watch_client: &WatchClient,
+    ) {
+        let (mut client_req_sender, mut client_resp_receiver) = watch_client
+            .watch()
+            .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
+        let (watch_id_sender, watch_id_receiver) = bounded::<i64>(1);
+        let this_clone2 = Arc::<Self>::clone(&this_clone);
+        let cache_clone2 = Arc::<Cache>::clone(&cache_clone);
+        // Task that handles all the pending watch requests.
+        smol::spawn(async move {
+            let mut shutdown_rx = shutdown_rx_1.into_future().fuse();
+            loop {
+                let watch_req = futures::select! {
+                    req_opt = watch_req_receiver.recv().fuse() => {
+                        if let Ok(req) = req_opt {
+                            req
+                        } else {
+                            warn!("Failed to receive watch request");
+                            Self::restart_cache(Arc::<Self>::clone(&this_clone)).await;
+                            return;
+                        }
+
+                    }
+                    _ = shutdown_rx => return
+
+                };
+                let processing_key = watch_req.get_key();
+                let res = client_req_sender
+                    .send((watch_req.clone().into(), WriteFlags::default()))
+                    .await;
+
+                if let Err(e) = res {
+                    warn!(
+                        "Fail to send watch request, the error is: {}, clean cache",
+                        e
+                    );
+                    Self::restart_cache(Arc::<Self>::clone(&this_clone)).await;
+                    return;
+                }
+                // Wait until etcd server returns watch id.
+                let watch_id = match watch_id_receiver.recv().await {
+                    Err(e) => {
+                        warn!(
+                            "Fail to receive watch id from channel, the error is {}, clean cache",
+                            e
+                        );
+                        Self::restart_cache(Arc::<Self>::clone(&this_clone)).await;
+                        return;
+                    }
+                    Ok(id) => id,
+                };
+                // Watch request can only be create or cancel.
+                if watch_req.is_create() {
+                    this_clone.cache_lock.read().await;
+                    cache_clone
+                        .update_watch_id(processing_key.clone(), watch_id)
+                        .await;
+                } else {
+                    this_clone.cache_lock.write().await;
+                    cache_clone.remove(&processing_key).await;
+                }
+            }
+        })
+        .detach();
+
+        // Task that handle the watch responses from Etcd server.
+        smol::spawn(async move {
+            let mut shutdown_rx = shutdown_rx_2.into_future().fuse();
+            loop {
+                let watch_resp = futures::select! {
+                    resp_opt = client_resp_receiver.next().fuse() => {
+                        if let Some(resp) = resp_opt {
+                            resp
+                        } else {
+                            warn!("failed to receive watch response from etcd");
+                            Self::restart_cache(Arc::<Self>::clone(&this_clone2)).await;
+                            return;
+                        }
+                    },
+                    _ = shutdown_rx => return
+                };
+
+                match watch_resp {
+                    Ok(resp) => {
+                        // TODO: Check if need to spawn new task here.
+                        if resp.get_created() || resp.get_canceled() {
+                            if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
+                                warn!("Fail to send watch id, the error is {}, clean cache", e);
+                                Self::restart_cache(Arc::<Self>::clone(&this_clone2)).await;
+                                return;
+                            }
+                        } else {
+                            let events = resp.get_events().to_vec();
+                            this_clone2.cache_lock.read().await;
+                            for event in events {
+                                if event.get_field_type() == Event_EventType::PUT {
+                                    cache_clone2
+                                        .update(
+                                            event.get_kv().get_key().to_vec(),
+                                            event.get_kv().clone(),
+                                            false,
+                                        )
+                                        .await;
+                                } else {
+                                    cache_clone2
+                                        .mark_delete(
+                                            event.get_kv().get_key().to_vec(),
+                                            event.get_kv().clone(),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Watch response contains error, the error is: {}, clean cache",
+                            e
+                        );
+                        Self::restart_cache(Arc::<Self>::clone(&this_clone2)).await;
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
     /// Clean cache
     #[inline]
-    async fn clean_cache(&self) {
-        self.cache_availability.write().await;
+    async fn restart_cache(self: Arc<Self>) {
+        self.cache_lock.write().await;
         self.cache.clean().await;
+        let mut shutdown1 = self.shutdown_task1.borrow_mut();
+        let mut shutdown2 = self.shutdown_task2.borrow_mut();
+        let (watch_req_sender, watch_req_receiver) = unbounded::<EtcdWatchRequest>();
+        let (shutdown_tx1, shutdown_rx_1) = unbounded();
+        let (shutdown_tx2, shutdown_rx_2) = unbounded();
+        let mut watch_sender = self.watch_sender.borrow_mut();
+        shutdown1
+            .send(())
+            .await
+            .unwrap_or_else(|e| panic!("failed to shutdown error is {:?}", e));
+        shutdown2
+            .send(())
+            .await
+            .unwrap_or_else(|e| panic!("failed to shutdown error is {:?}", e));
+        shutdown1.close();
+        shutdown2.close();
+        Self::start_watch_task(
+            Arc::<Self>::clone(&self),
+            Arc::<Cache>::clone(&self.cache),
+            shutdown_rx_1,
+            shutdown_rx_2,
+            watch_req_receiver,
+            &self.watch_client,
+        );
+        *shutdown1 = shutdown_tx1;
+        *shutdown2 = shutdown_tx2;
+        *watch_sender = watch_req_sender;
     }
 }
-
-#[async_trait]
-impl Shutdown for Arc<KvInner> {
-    async fn shutdown(&mut self) -> Res<()> {
-        if self.cache_enable {
-            self.shutdown.send(()).await?;
-            self.shutdown.close();
-        }
-        Ok(())
-    }
-}
-
 impl Kv {
     /// Creates a new `KvClient`.
     ///
@@ -247,12 +307,9 @@ impl Kv {
         cache_enable: bool,
     ) -> Self {
         Self {
-            inner: Arc::new(Lazy::new(move || {
-                KvInner::new(client.clone(), &watch_client, cache_size, cache_enable)
-            })),
+            inner: KvInner::new(client, watch_client, cache_size, cache_enable),
         }
     }
-
     /// Performs a key-value saving operation.
     ///
     /// # Errors
@@ -260,32 +317,10 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn put(&self, req: EtcdPutRequest) -> Res<EtcdPutResponse> {
-        let inner = self.inner.write().await;
-        let key = req.get_key();
         let resp: EtcdPutResponse = retryable!(|| async {
-            let resp = inner.client.put_async(&req.clone().into())?;
+            let resp = self.inner.client.put_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
-
-        if inner.cache_enable {
-            if let Some(cache_lock) = inner.cache_availability.try_read() {
-                if inner.cache.search(key.clone()).await == None {
-                    let revision = resp.get_revision();
-                    // Creates a new watch request and adds to the send queue.
-                    let mut watch_request = EtcdWatchRequest::create(KeyRange::key(key));
-                    watch_request.set_start_revision(revision.cast());
-                    if let Err(e) = inner.watch_sender.send(watch_request).await {
-                        warn!(
-                            "Fail to send watch request, the error is {}, clean cache",
-                            e
-                        );
-                        drop(cache_lock);
-                        inner.clean_cache().await;
-                    }
-                }
-            }
-        }
-
         Ok(resp)
     }
 
@@ -296,9 +331,8 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn get(&self, req: EtcdGetRequest) -> Res<EtcdGetResponse> {
-        let inner = self.inner.read().await;
-        if inner.cache_enable && inner.cache_availability.try_read().is_some() {
-            if let Some(value) = inner.cache.search(req.get_key()).await {
+        if self.inner.cache_enable && self.inner.cache_lock.try_read().is_some() {
+            if let Some(value) = self.inner.cache.search(req.get_key()).await {
                 let mut response = RangeResponse::new();
                 response.set_count(1);
                 response.set_kvs(RepeatedField::from_vec(vec![value]));
@@ -307,27 +341,57 @@ impl Kv {
         }
 
         let resp = retryable!(|| async {
-            let resp = inner.client.range_async(&req.clone().into())?;
+            let resp = self.inner.client.range_async(&req.clone().into())?;
             Ok(resp.await?)
         });
-        if inner.cache_enable {
-            if let Some(cache_lock) = inner.cache_availability.try_read() {
+        if self.inner.cache_enable {
+            if let Some(cache_lock) = self.inner.cache_lock.try_write() {
                 let kvs = resp.get_kvs();
                 for kv in kvs {
-                    if inner.cache.search(kv.get_key().to_vec()).await == None {
+                    if self
+                        .inner
+                        .cache
+                        .search(kv.get_key().to_vec())
+                        .await
+                        .is_none()
+                    {
+                        self.inner
+                            .cache
+                            .insert_or_update(kv.get_key().to_vec(), kv.clone())
+                            .await;
                         // Creates a new watch request and adds to the send queue.
-                        let watch_request = EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
-                        if let Err(e) = inner.watch_sender.send(watch_request).await {
+                        let mut watch_request =
+                            EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
+                        watch_request.set_start_revision(kv.get_mod_revision().cast());
+                        if let Err(e) = self.inner.watch_sender.borrow().send(watch_request).await {
                             warn!(
                                 "Fail to send watch request, the error is {}, clean cache",
                                 e
                             );
                             drop(cache_lock);
-                            inner.clean_cache().await;
+                            KvInner::restart_cache(Arc::<KvInner>::clone(&self.inner)).await;
                             break;
                         }
+                    } else {
+                        self.inner
+                            .cache
+                            .update(kv.get_key().to_vec(), kv.clone(), false)
+                            .await;
                     }
-                    inner.cache.insert(kv.get_key().to_vec(), kv.clone()).await;
+                    if let Err(e) = self
+                        .inner
+                        .cache
+                        .adjust_cache_size(&self.inner.watch_sender.borrow())
+                        .await
+                    {
+                        warn!(
+                            "Fail to send watch request, the error is {}, clean cache",
+                            e
+                        );
+                        drop(cache_lock);
+                        KvInner::restart_cache(Arc::<KvInner>::clone(&self.inner)).await;
+                        break;
+                    }
                 }
             }
         }
@@ -341,9 +405,8 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn range(&self, req: EtcdRangeRequest) -> Res<EtcdRangeResponse> {
-        let inner = self.inner.read().await;
         let resp = retryable!(|| async {
-            let resp = inner.client.range_async(&req.clone().into())?;
+            let resp = self.inner.client.range_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
         Ok(resp)
@@ -356,9 +419,8 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn delete(&self, req: EtcdDeleteRequest) -> Res<EtcdDeleteResponse> {
-        let inner = self.inner.read().await;
         let resp = retryable!(|| async {
-            let resp = inner.client.delete_range_async(&req.clone().into())?;
+            let resp = self.inner.client.delete_range_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
         Ok(resp)
@@ -371,9 +433,8 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn txn(&self, req: EtcdTxnRequest) -> Res<EtcdTxnResponse> {
-        let inner = self.inner.read().await;
         let resp = retryable!(|| async {
-            let resp = inner.client.txn_async(&req.clone().into())?;
+            let resp = self.inner.client.txn_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
         Ok(resp)
@@ -386,7 +447,14 @@ impl Kv {
     /// Will return `Err` if kv is shutdown.
     #[inline]
     pub async fn shutdown(&self) -> Res<()> {
-        self.inner.evict().await
+        if self.inner.cache_enable {
+            self.inner.cache_lock.write().await;
+            self.inner.shutdown_task1.borrow().send(()).await?;
+            self.inner.shutdown_task2.borrow().send(()).await?;
+            self.inner.shutdown_task1.borrow().close();
+            self.inner.shutdown_task2.borrow().close();
+        }
+        Ok(())
     }
 }
 

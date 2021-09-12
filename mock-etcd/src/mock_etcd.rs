@@ -1056,7 +1056,7 @@ mod test {
                 .watch(KeyRange::range(key000.clone(), key100.clone()))
                 .await;
 
-            let watch_id = 8; // 0-7 is used by e2e_test()
+            let watch_id = 0;
             if let Some(resp) = resp_receiver.next().await {
                 assert_eq!(
                     resp.unwrap_or_else(|e| panic!(
