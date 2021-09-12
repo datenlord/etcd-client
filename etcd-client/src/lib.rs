@@ -85,9 +85,9 @@ pub use client::{Client, ClientConfig};
 pub use clippy_utilities::OverflowArithmetic;
 pub use error::EtcdError;
 pub use kv::{
-    EtcdDeleteRequest, EtcdDeleteResponse, EtcdKeyValue, EtcdPutRequest, EtcdPutResponse,
-    EtcdRangeRequest, EtcdRangeResponse, EtcdTxnRequest, EtcdTxnResponse, KeyRange, Kv, TxnCmp,
-    TxnOpResponse,
+    EtcdDeleteRequest, EtcdDeleteResponse, EtcdGetRequest, EtcdGetResponse, EtcdKeyValue,
+    EtcdPutRequest, EtcdPutResponse, EtcdRangeRequest, EtcdRangeResponse, EtcdTxnRequest,
+    EtcdTxnResponse, KeyRange, Kv, TxnCmp, TxnOpResponse,
 };
 pub use lease::{
     EtcdLeaseGrantRequest, EtcdLeaseGrantResponse, EtcdLeaseKeepAliveRequest,

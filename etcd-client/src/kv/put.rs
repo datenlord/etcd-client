@@ -57,8 +57,8 @@ impl EtcdPutRequest {
 
     /// Gets the key from `PutRequest`.
     #[inline]
-    pub fn get_key(&self) -> Vec<u8> {
-        self.proto.get_key().to_vec()
+    pub fn get_key(&self) -> &[u8] {
+        self.proto.get_key()
     }
 
     /// Gets the value from `PutRequest`.
