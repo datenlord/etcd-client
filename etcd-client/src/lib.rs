@@ -271,6 +271,7 @@ mod tests {
             1,
             "Receive wrong watch events from etcd server"
         );
+        client.shutdown().await?;
         Ok(())
     }
 

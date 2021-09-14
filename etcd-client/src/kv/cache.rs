@@ -3,10 +3,9 @@ use super::KeyValue;
 use super::OverflowArithmetic;
 use crate::watch::EtcdWatchRequest;
 use crate::Result as Res;
-use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
 use priority_queue::PriorityQueue;
 use smol::channel::Sender;
-use smol::lock::Mutex;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use utilities::Cast;
 
@@ -32,137 +31,89 @@ impl CacheEntry {
         }
     }
 }
-/// Cache struct contains a lock-free hashTable.
+/// Cache struct.
 pub struct Cache {
-    /// map to store key value
-    hashtable: LockFreeCuckooHash<Vec<u8>, CacheEntry>,
-    /// lru queue to store the keys in hashtable.
-    lru_queue: Mutex<PriorityQueue<Vec<u8>, u64>>,
+    /// map to store `CacheEntry`
+    hashtable: HashMap<Vec<u8>, CacheEntry>,
+    /// lru queue of the keys in hashtable.
+    lru_queue: PriorityQueue<Vec<u8>, u64>,
 }
 
 impl Cache {
     /// Create a new `Cache` with specified size.
     pub fn new(size: usize) -> Self {
         Self {
-            hashtable: LockFreeCuckooHash::with_capacity(size),
-            lru_queue: Mutex::new(PriorityQueue::new()),
+            hashtable: HashMap::with_capacity(size),
+            lru_queue: PriorityQueue::new(),
         }
     }
 
-    /// Searches a `key` from the cache.
-    pub async fn search(&self, key: Vec<u8>) -> Option<KeyValue> {
-        let search_result = {
-            let guard = pin();
-            self.hashtable.get(&key, &guard).cloned()
-        };
+    /// Search a `key` from the cache.
+    pub fn search(&mut self, key: Vec<u8>) -> Option<KeyValue> {
+        let search_result = self.hashtable.get(&key).cloned();
         match search_result {
-            Some(entry) => {
-                if let Some(kv) = entry.kv {
-                    self.lru_queue.lock().await.push(key, Self::get_priority());
-                    Some(kv)
-                } else {
-                    None
-                }
-            }
+            Some(entry) => entry.kv.map(|kv| {
+                self.lru_queue.push(key, Self::get_priority());
+                kv
+            }),
             None => None,
         }
     }
 
+    /// Check if a `key` is in cache
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.hashtable.contains_key(key)
+    }
+
     /// Update a `key` to cache
-    pub async fn update(&self, key: Vec<u8>, value: KeyValue, mark_delete: bool) {
-        loop {
-            let value_clone = value.clone();
-            let search_result = {
-                let guard = pin();
-                self.hashtable.get(&key, &guard).cloned()
-            };
-            if let Some(ref entry) = search_result {
-                let revision = value_clone.get_mod_revision();
-                if revision > entry.revision {
-                    if self.hashtable.compare_and_update(
-                        key.clone(),
-                        CacheEntry::new(
-                            if mark_delete { None } else { Some(value_clone) },
-                            revision,
-                            entry.watch_id,
-                        ),
-                        entry,
-                    ) {
-                        self.lru_queue
-                            .lock()
-                            .await
-                            .push(key.clone(), Self::get_priority());
-                        break;
-                    } else {
-                        continue;
-                    }
-                } else {
-                    break;
-                }
+    pub fn update(&mut self, key: &[u8], value: KeyValue, mark_delete: bool) {
+        let entry = self
+            .hashtable
+            .get_mut(key)
+            .unwrap_or_else(|| panic!("Key {:?} doesn't exist", key));
+        let revision = value.get_mod_revision();
+        if revision > entry.revision {
+            if mark_delete {
+                entry.kv = None
             } else {
-                panic!("key {:?} is deleted during update", key);
+                entry.kv = Some(value);
             }
+            entry.revision = revision;
+            self.lru_queue.push(key.to_vec(), Self::get_priority());
         }
     }
 
     /// Insert or update a `key` to the cache.
-    pub async fn insert_or_update(&self, key: Vec<u8>, value: KeyValue) {
+    pub fn insert_or_update(&mut self, key: Vec<u8>, value: KeyValue) {
         let revision = value.get_mod_revision();
-        if self.hashtable.insert_if_not_exists(
-            key.clone(),
-            CacheEntry::new(Some(value.clone()), revision, -1),
-        ) {
-            self.lru_queue
-                .lock()
-                .await
-                .push(key.clone(), Self::get_priority());
+        if self.hashtable.contains_key(&key) {
+            self.update(&key, value, false);
         } else {
-            self.update(key, value, false).await;
+            self.hashtable
+                .insert(key.clone(), CacheEntry::new(Some(value), revision, -1));
         }
+        self.lru_queue.push(key, Self::get_priority());
     }
 
     /// Remove a `key` from cache totally
-    pub async fn remove(&self, key: &[u8]) {
+    pub fn remove(&mut self, key: &[u8]) {
         self.hashtable.remove(key);
-        self.lru_queue.lock().await.remove(key);
+        self.lru_queue.remove(key);
     }
 
     /// Mark a `key` as delete.
-    pub async fn mark_delete(&self, key: Vec<u8>, value: KeyValue) {
-        let search_result = {
-            let guard = pin();
-            self.hashtable.get(&key, &guard).cloned()
-        };
-        if search_result.is_some() {
-            self.update(key, value, true).await;
-        }
+    pub fn mark_delete(&mut self, key: &[u8], value: KeyValue) {
+        self.update(key, value, true);
     }
 
     /// Update watch id of a `key`
-    pub async fn update_watch_id(&self, key: Vec<u8>, watch_id: i64) {
-        loop {
-            let search_result = {
-                let guard = pin();
-                self.hashtable.get(&key, &guard).cloned()
-            };
-            if let Some(ref entry) = search_result {
-                if self.hashtable.compare_and_update(
-                    key.clone(),
-                    CacheEntry::new(entry.kv.clone(), entry.revision, watch_id),
-                    entry,
-                ) {
-                    self.lru_queue
-                        .lock()
-                        .await
-                        .push(key.clone(), Self::get_priority());
-                    break;
-                } else {
-                    continue;
-                }
-            } else {
-                panic!("key {:?} is deleted during update", key);
-            }
-        }
+    pub fn update_watch_id(&mut self, key: Vec<u8>, watch_id: i64) {
+        let entry = self
+            .hashtable
+            .get_mut(&key)
+            .unwrap_or_else(|| panic!("Key {:?} doesn't exist", key));
+        entry.watch_id = watch_id;
+        self.lru_queue.push(key, Self::get_priority());
     }
 
     /// Gets the priority of a key in lru queue.
@@ -177,21 +128,16 @@ impl Cache {
 
     /// Adjusts cache size if the number of value in cache has exceed the threshold(0.8 * capacity).
     /// Adjusts cache to 0.6 * capacity
-    pub async fn adjust_cache_size(&self, watch_sender: &Sender<EtcdWatchRequest>) -> Res<()> {
-        if self.hashtable.size() > self.hashtable.capacity().overflow_mul(8).overflow_div(10) {
-            let mut queue = self.lru_queue.lock().await;
-            while self.hashtable.size() > self.hashtable.capacity().overflow_mul(6).overflow_div(10)
+    pub async fn adjust_cache_size(&mut self, watch_sender: &Sender<EtcdWatchRequest>) -> Res<()> {
+        if self.hashtable.len() > self.hashtable.capacity().overflow_mul(8).overflow_div(10) {
+            while self.hashtable.len() > self.hashtable.capacity().overflow_mul(6).overflow_div(10)
             {
-                if let Some(pop_value) = queue.pop() {
+                if let Some(pop_value) = self.lru_queue.pop() {
                     let key = pop_value.0;
-                    let search_result = {
-                        let guard = pin();
-                        self.hashtable.get(&key, &guard).cloned()
-                    };
-                    if let Some(value) = search_result {
-                        self.hashtable.remove(&key);
+
+                    if let Some(entry) = self.hashtable.remove(&key) {
                         watch_sender
-                            .send(EtcdWatchRequest::cancel(value.watch_id.cast()))
+                            .send(EtcdWatchRequest::cancel(entry.watch_id.cast()))
                             .await?;
                     } else {
                         panic!("lru cache doesn't match hashmap key is {:?}", key);
@@ -205,12 +151,8 @@ impl Cache {
     }
 
     /// Clean cache
-    #[allow(unsafe_code)]
-    pub async fn clean(&self) {
-        unsafe {
-            self.hashtable.clear();
-        }
-        let mut queue = self.lru_queue.lock().await;
-        queue.clear();
+    pub fn clean(&mut self) {
+        self.hashtable.clear();
+        self.lru_queue.clear();
     }
 }

@@ -38,7 +38,7 @@ use grpcio::WriteFlags;
 use log::warn;
 use protobuf::RepeatedField;
 use smol::channel::{bounded, unbounded, Sender};
-use smol::lock::RwLock;
+use smol::lock::{RwLock, RwLockWriteGuard};
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,19 +60,15 @@ pub struct KvInner {
     /// Etcd Key-Value client.
     client: KvClient,
     /// Etcd client cache.
-    cache: Arc<Cache>,
+    cache: Arc<RwLock<Cache>>,
     /// Enable etcd client cache.
     cache_enable: bool,
     /// Etcd watch request sender.
-    watch_sender: AtomicRefCell<Sender<EtcdWatchRequest>>,
-    /// Read write lock to access cache
-    /// When the cache has error, write lock is acquired to disable the cache and clean the cache.
-    /// Other operations will get read lock.
-    cache_lock: RwLock<()>,
+    watch_sender: AtomicRefCell<Option<Sender<EtcdWatchRequest>>>,
     /// A channel sender to send shutdown request.
-    shutdown_task1: AtomicRefCell<Sender<()>>,
+    shutdown_task1: AtomicRefCell<Option<Sender<()>>>,
     /// A channel sender to send shutdown request.
-    shutdown_task2: AtomicRefCell<Sender<()>>,
+    shutdown_task2: AtomicRefCell<Option<Sender<()>>>,
     /// Watch Client
     watch_client: WatchClient,
 }
@@ -95,25 +91,22 @@ impl KvInner {
             cache_size
         };
 
-        let cache = Arc::new(Cache::new(etcd_cache_size));
-        let (watch_req_sender, watch_req_receiver) = unbounded::<EtcdWatchRequest>();
-        let (shutdown_tx1, shutdown_rx_1) = unbounded();
-        let (shutdown_tx2, shutdown_rx_2) = unbounded();
-
-        let cache_clone = Arc::<Cache>::clone(&cache);
-        let watch_client_clone = watch_client.clone();
-        let this = Arc::new(Self {
-            client,
-            cache,
-            cache_enable,
-            watch_sender: AtomicRefCell::new(watch_req_sender),
-            cache_lock: RwLock::new(()),
-            shutdown_task1: AtomicRefCell::new(shutdown_tx1),
-            shutdown_task2: AtomicRefCell::new(shutdown_tx2),
-            watch_client,
-        });
-
+        let cache = Arc::new(RwLock::new(Cache::new(etcd_cache_size)));
         if cache_enable {
+            let cache_clone = Arc::<RwLock<Cache>>::clone(&cache);
+            let watch_client_clone = watch_client.clone();
+            let (watch_req_sender, watch_req_receiver) = unbounded::<EtcdWatchRequest>();
+            let (shutdown_tx1, shutdown_rx_1) = unbounded();
+            let (shutdown_tx2, shutdown_rx_2) = unbounded();
+            let this = Arc::new(Self {
+                client,
+                cache,
+                cache_enable,
+                watch_sender: AtomicRefCell::new(Some(watch_req_sender)),
+                shutdown_task1: AtomicRefCell::new(Some(shutdown_tx1)),
+                shutdown_task2: AtomicRefCell::new(Some(shutdown_tx2)),
+                watch_client,
+            });
             Self::start_watch_task(
                 Arc::<Self>::clone(&this),
                 cache_clone,
@@ -121,9 +114,19 @@ impl KvInner {
                 shutdown_rx_2,
                 watch_req_receiver,
                 &watch_client_clone,
-            )
-        };
-        this
+            );
+            this
+        } else {
+            Arc::new(Self {
+                client,
+                cache,
+                cache_enable,
+                watch_sender: AtomicRefCell::new(None),
+                shutdown_task1: AtomicRefCell::new(None),
+                shutdown_task2: AtomicRefCell::new(None),
+                watch_client,
+            })
+        }
     }
 
     /// Start async watch task
@@ -131,7 +134,7 @@ impl KvInner {
     #[allow(clippy::too_many_lines)]
     fn start_watch_task(
         this_clone: Arc<Self>,
-        cache_clone: Arc<Cache>,
+        cache_clone: Arc<RwLock<Cache>>,
         shutdown_rx_1: Receiver<()>,
         shutdown_rx_2: Receiver<()>,
         watch_req_receiver: Receiver<EtcdWatchRequest>,
@@ -142,7 +145,7 @@ impl KvInner {
             .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
         let (watch_id_sender, watch_id_receiver) = bounded::<i64>(1);
         let this_clone2 = Arc::<Self>::clone(&this_clone);
-        let cache_clone2 = Arc::<Cache>::clone(&cache_clone);
+        let cache_clone2 = Arc::<RwLock<Cache>>::clone(&cache_clone);
         // Task that handles all the pending watch requests.
         smol::spawn(async move {
             let mut shutdown_rx = shutdown_rx_1.into_future().fuse();
@@ -153,7 +156,8 @@ impl KvInner {
                             req
                         } else {
                             warn!("Failed to receive watch request");
-                            Self::restart_cache(Arc::<Self>::clone(&this_clone)).await;
+                            let mut cache = this_clone.cache.write().await;
+                            Self::restart_cache(Arc::<Self>::clone(&this_clone), &mut cache).await;
                             return;
                         }
 
@@ -171,7 +175,8 @@ impl KvInner {
                         "Fail to send watch request, the error is: {}, clean cache",
                         e
                     );
-                    Self::restart_cache(Arc::<Self>::clone(&this_clone)).await;
+                    let mut cache = this_clone.cache.write().await;
+                    Self::restart_cache(Arc::<Self>::clone(&this_clone), &mut cache).await;
                     return;
                 }
                 // Wait until etcd server returns watch id.
@@ -181,20 +186,18 @@ impl KvInner {
                             "Fail to receive watch id from channel, the error is {}, clean cache",
                             e
                         );
-                        Self::restart_cache(Arc::<Self>::clone(&this_clone)).await;
+                        let mut cache = this_clone.cache.write().await;
+                        Self::restart_cache(Arc::<Self>::clone(&this_clone), &mut cache).await;
                         return;
                     }
                     Ok(id) => id,
                 };
                 // Watch request can only be create or cancel.
+                let mut cache = cache_clone.write().await;
                 if watch_req.is_create() {
-                    this_clone.cache_lock.read().await;
-                    cache_clone
-                        .update_watch_id(processing_key.clone(), watch_id)
-                        .await;
+                    cache.update_watch_id(processing_key.clone(), watch_id);
                 } else {
-                    this_clone.cache_lock.write().await;
-                    cache_clone.remove(&processing_key).await;
+                    cache.remove(&processing_key);
                 }
             }
         })
@@ -210,7 +213,8 @@ impl KvInner {
                             resp
                         } else {
                             warn!("failed to receive watch response from etcd");
-                            Self::restart_cache(Arc::<Self>::clone(&this_clone2)).await;
+                            let mut cache = this_clone2.cache.write().await;
+                            Self::restart_cache(Arc::<Self>::clone(&this_clone2), &mut cache).await;
                             return;
                         }
                     },
@@ -223,28 +227,23 @@ impl KvInner {
                         if resp.get_created() || resp.get_canceled() {
                             if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
                                 warn!("Fail to send watch id, the error is {}, clean cache", e);
-                                Self::restart_cache(Arc::<Self>::clone(&this_clone2)).await;
+                                let mut cache = this_clone2.cache.write().await;
+                                Self::restart_cache(Arc::<Self>::clone(&this_clone2), &mut cache)
+                                    .await;
                                 return;
                             }
                         } else {
                             let events = resp.get_events().to_vec();
-                            this_clone2.cache_lock.read().await;
+                            let mut cache = cache_clone2.write().await;
                             for event in events {
+                                let key = event.get_kv().get_key();
+                                if !cache.contains_key(key) {
+                                    continue;
+                                }
                                 if event.get_field_type() == Event_EventType::PUT {
-                                    cache_clone2
-                                        .update(
-                                            event.get_kv().get_key().to_vec(),
-                                            event.get_kv().clone(),
-                                            false,
-                                        )
-                                        .await;
+                                    cache.update(key, event.get_kv().clone(), false);
                                 } else {
-                                    cache_clone2
-                                        .mark_delete(
-                                            event.get_kv().get_key().to_vec(),
-                                            event.get_kv().clone(),
-                                        )
-                                        .await;
+                                    cache.mark_delete(key, event.get_kv().clone());
                                 }
                             }
                         }
@@ -254,7 +253,8 @@ impl KvInner {
                             "Watch response contains error, the error is: {}, clean cache",
                             e
                         );
-                        Self::restart_cache(Arc::<Self>::clone(&this_clone2)).await;
+                        let mut cache = this_clone2.cache.write().await;
+                        Self::restart_cache(Arc::<Self>::clone(&this_clone2), &mut cache).await;
                         return;
                     }
                 }
@@ -264,11 +264,17 @@ impl KvInner {
     }
     /// Clean cache
     #[inline]
-    async fn restart_cache(self: Arc<Self>) {
-        self.cache_lock.write().await;
-        self.cache.clean().await;
-        let mut shutdown1 = self.shutdown_task1.borrow_mut();
-        let mut shutdown2 = self.shutdown_task2.borrow_mut();
+    async fn restart_cache(self: Arc<Self>, cache: &mut RwLockWriteGuard<'_, Cache>) {
+        cache.clean();
+        let mut shutdown1_opt = self.shutdown_task1.borrow_mut();
+        let mut shutdown2_opt = self.shutdown_task2.borrow_mut();
+
+        let shutdown1 = shutdown1_opt
+            .as_ref()
+            .unwrap_or_else(|| panic!("shutdown1 is empty"));
+        let shutdown2 = shutdown2_opt
+            .as_ref()
+            .unwrap_or_else(|| panic!("shutdown2 is empty"));
         let (watch_req_sender, watch_req_receiver) = unbounded::<EtcdWatchRequest>();
         let (shutdown_tx1, shutdown_rx_1) = unbounded();
         let (shutdown_tx2, shutdown_rx_2) = unbounded();
@@ -285,15 +291,15 @@ impl KvInner {
         shutdown2.close();
         Self::start_watch_task(
             Arc::<Self>::clone(&self),
-            Arc::<Cache>::clone(&self.cache),
+            Arc::<RwLock<Cache>>::clone(&self.cache),
             shutdown_rx_1,
             shutdown_rx_2,
             watch_req_receiver,
             &self.watch_client,
         );
-        *shutdown1 = shutdown_tx1;
-        *shutdown2 = shutdown_tx2;
-        *watch_sender = watch_req_sender;
+        *shutdown1_opt = Some(shutdown_tx1);
+        *shutdown2_opt = Some(shutdown_tx2);
+        *watch_sender = Some(watch_req_sender);
     }
 }
 impl Kv {
@@ -331,8 +337,9 @@ impl Kv {
     /// Will return `Err` if RPC call is failed.
     #[inline]
     pub async fn get(&self, req: EtcdGetRequest) -> Res<EtcdGetResponse> {
-        if self.inner.cache_enable && self.inner.cache_lock.try_read().is_some() {
-            if let Some(value) = self.inner.cache.search(req.get_key()).await {
+        if self.inner.cache_enable {
+            let mut cache = self.inner.cache.write().await;
+            if let Some(value) = cache.search(req.get_key()) {
                 let mut response = RangeResponse::new();
                 response.set_count(1);
                 response.set_kvs(RepeatedField::from_vec(vec![value]));
@@ -345,53 +352,51 @@ impl Kv {
             Ok(resp.await?)
         });
         if self.inner.cache_enable {
-            if let Some(cache_lock) = self.inner.cache_lock.try_write() {
-                let kvs = resp.get_kvs();
-                for kv in kvs {
-                    if self
-                        .inner
-                        .cache
-                        .search(kv.get_key().to_vec())
-                        .await
-                        .is_none()
-                    {
-                        self.inner
-                            .cache
-                            .insert_or_update(kv.get_key().to_vec(), kv.clone())
-                            .await;
-                        // Creates a new watch request and adds to the send queue.
-                        let mut watch_request =
-                            EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
-                        watch_request.set_start_revision(kv.get_mod_revision().cast());
-                        if let Err(e) = self.inner.watch_sender.borrow().send(watch_request).await {
-                            warn!(
-                                "Fail to send watch request, the error is {}, clean cache",
-                                e
-                            );
-                            drop(cache_lock);
-                            KvInner::restart_cache(Arc::<KvInner>::clone(&self.inner)).await;
-                            break;
-                        }
-                    } else {
-                        self.inner
-                            .cache
-                            .update(kv.get_key().to_vec(), kv.clone(), false)
-                            .await;
-                    }
+            let mut cache = self.inner.cache.write().await;
+            let kvs = resp.get_kvs();
+            for kv in kvs {
+                let key = kv.get_key().to_vec();
+                if cache.contains_key(&key) {
+                    cache.update(&kv.get_key().to_vec(), kv.clone(), false);
+                } else {
+                    cache.insert_or_update(key, kv.clone());
+                    // Creates a new watch request and adds to the send queue.
+                    let mut watch_request = EtcdWatchRequest::create(KeyRange::key(kv.get_key()));
+                    watch_request.set_start_revision(kv.get_mod_revision().cast());
                     if let Err(e) = self
                         .inner
-                        .cache
-                        .adjust_cache_size(&self.inner.watch_sender.borrow())
+                        .watch_sender
+                        .borrow()
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("watch sender is empty"))
+                        .send(watch_request)
                         .await
                     {
                         warn!(
                             "Fail to send watch request, the error is {}, clean cache",
                             e
                         );
-                        drop(cache_lock);
-                        KvInner::restart_cache(Arc::<KvInner>::clone(&self.inner)).await;
+                        KvInner::restart_cache(Arc::<KvInner>::clone(&self.inner), &mut cache)
+                            .await;
                         break;
                     }
+                }
+                if let Err(e) = cache
+                    .adjust_cache_size(
+                        self.inner
+                            .watch_sender
+                            .borrow()
+                            .as_ref()
+                            .unwrap_or_else(|| panic!("watch send is empty")),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Fail to send watch request, the error is {}, clean cache",
+                        e
+                    );
+                    KvInner::restart_cache(Arc::<KvInner>::clone(&self.inner), &mut cache).await;
+                    break;
                 }
             }
         }
@@ -448,11 +453,19 @@ impl Kv {
     #[inline]
     pub async fn shutdown(&self) -> Res<()> {
         if self.inner.cache_enable {
-            self.inner.cache_lock.write().await;
-            self.inner.shutdown_task1.borrow().send(()).await?;
-            self.inner.shutdown_task2.borrow().send(()).await?;
-            self.inner.shutdown_task1.borrow().close();
-            self.inner.shutdown_task2.borrow().close();
+            self.inner.cache.write().await;
+            let shutdown_1_opt = self.inner.shutdown_task1.borrow();
+            let shutdown_2_opt = self.inner.shutdown_task2.borrow();
+            let shutdown_1 = shutdown_1_opt
+                .as_ref()
+                .unwrap_or_else(|| panic!("shutdown_task1 is empty"));
+            let shutdown_2 = shutdown_2_opt
+                .as_ref()
+                .unwrap_or_else(|| panic!("shutdown_task2 is empty"));
+            shutdown_1.send(()).await?;
+            shutdown_2.send(()).await?;
+            shutdown_1.close();
+            shutdown_2.close();
         }
         Ok(())
     }
