@@ -37,13 +37,14 @@ async fn success<R: Send>(response: R, sink: UnarySink<R>) {
 }
 
 /// Send failure `gRPC` response
-fn fail<R>(ctx: &RpcContext, sink: UnarySink<R>, rsc: RpcStatusCode, details: String) {
+fn fail<R>(ctx: &RpcContext, sink: UnarySink<R>, rsc: RpcStatusCode, _details: String) {
     debug_assert_ne!(
         rsc,
         RpcStatusCode::OK,
         "the input RpcStatusCode should not be OK"
     );
-    let rs = RpcStatus::new(rsc, Some(details));
+    let rs = RpcStatus::new(rsc);
+    //let rs = RpcStatus::new(details);
     let f = sink
         .fail(rs)
         .map_err(|e| error!("failed to send response, the error is: {:?}", e))
@@ -576,7 +577,6 @@ impl Lease for MockEtcd {
     ) {
         let rs = RpcStatus::new(
             RpcStatusCode::UNIMPLEMENTED,
-            Some("Not Implemented".to_owned()),
         );
         let f = sink
             .fail(rs)
