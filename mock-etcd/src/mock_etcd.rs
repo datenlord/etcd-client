@@ -43,7 +43,16 @@ fn fail<R>(ctx: &RpcContext, sink: UnarySink<R>, rsc: RpcStatusCode, details: St
         RpcStatusCode::OK,
         "the input RpcStatusCode should not be OK"
     );
-    let rs = RpcStatus::new(rsc, Some(details));
+<<<<<<< HEAD
+<<<<<<< HEAD
+    let rs = RpcStatus::with_message(rsc, details);
+=======
+    let rs = RpcStatus::new(rsc);
+    //let rs = RpcStatus::new(details);
+>>>>>>> 1956e3c (change some detail)
+=======
+    let rs = RpcStatus::with_message(rsc, details);
+>>>>>>> a3aba21 (fix comment)
     let f = sink
         .fail(rs)
         .map_err(|e| error!("failed to send response, the error is: {:?}", e))
@@ -574,10 +583,8 @@ impl Lease for MockEtcd {
         _req: RequestStream<LeaseKeepAliveRequest>,
         sink: DuplexSink<LeaseKeepAliveResponse>,
     ) {
-        let rs = RpcStatus::new(
-            RpcStatusCode::UNIMPLEMENTED,
-            Some("Not Implemented".to_owned()),
-        );
+        let rs =
+            RpcStatus::with_message(RpcStatusCode::UNIMPLEMENTED, "Not Implemented".to_owned());
         let f = sink
             .fail(rs)
             .map_err(|e| error!("failed to send response, the error is: {:?}", e))
