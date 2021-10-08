@@ -19,7 +19,7 @@ async-trait = "0.1"
 backoff = { version = "0.3.0", features = ["futures"] }
 bytes = "0.5"
 futures = "0.3.5"
-grpcio = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
+grpcio = { version = "0.8.0", default-features = false, features = ["protobuf-codec"] }
 http = "0.2"
 log = "0.4.11"
 lockfree-cuckoohash = { git = "https://github.com/datenlord/lockfree-cuckoohash.git", rev = "69ccd5a"}
