@@ -22,7 +22,7 @@ smol = { version = "1.2.5" }
 
 
 [build-dependencies]
-protoc-grpcio = "2.0.0"
+protoc-grpcio = "3.0.0"
 
 [dev-dependencies]
 etcd-client = { path = "../etcd-client" }
