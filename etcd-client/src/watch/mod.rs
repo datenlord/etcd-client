@@ -43,7 +43,6 @@
 //! }
 //!
 //! ```
-#[allow(warnings)]
 
 use std::sync::Arc;
 
