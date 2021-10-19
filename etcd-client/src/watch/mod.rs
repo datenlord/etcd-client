@@ -71,7 +71,7 @@ mod watch_impl;
 
 /// `WatchTunnel` is a reusable connection for `Watch` operation
 /// The underlying `gRPC` method is Bi-directional streaming
-struct WatchTunnel {
+pub struct WatchTunnel {
     /// A channel sender to send watch request.
     req_sender: Sender<EtcdWatchRequest>,
     /// A channel receiver to receive watch response.
@@ -173,9 +173,9 @@ impl Shutdown for WatchTunnel {
 #[derive(Clone)]
 pub struct Watch {
     /// Etcd watch client provides watch realted operations.
-    client: WatchClient,
+    pub client: WatchClient,
     /// A tunnel used to communicate with Etcd server for watch operations.
-    tunnel: Arc<Lazy<WatchTunnel>>,
+    pub tunnel: Arc<Lazy<WatchTunnel>>,
 }
 
 impl Watch {
