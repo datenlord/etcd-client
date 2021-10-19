@@ -67,7 +67,7 @@
     // unused_results,
     variant_size_differences,
 
-    //warnings, // treat all wanings as errors
+    warnings, // treat all wanings as errors
 
     clippy::all,
     clippy::restriction,
