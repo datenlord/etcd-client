@@ -574,10 +574,8 @@ impl Lease for MockEtcd {
         _req: RequestStream<LeaseKeepAliveRequest>,
         sink: DuplexSink<LeaseKeepAliveResponse>,
     ) {
-        // let rs = RpcStatus::new(
-        //     RpcStatusCode::UNIMPLEMENTED,
-        // );
-        let rs = RpcStatus::with_message(RpcStatusCode::UNIMPLEMENTED, "Not Implemented".to_owned());
+        let rs =
+            RpcStatus::with_message(RpcStatusCode::UNIMPLEMENTED, "Not Implemented".to_owned());
         let f = sink
             .fail(rs)
             .map_err(|e| error!("failed to send response, the error is: {:?}", e))
