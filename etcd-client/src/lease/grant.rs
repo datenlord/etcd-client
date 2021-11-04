@@ -28,14 +28,14 @@ impl EtcdLeaseGrantRequest {
     /// Set custom lease ID.
     #[inline]
     pub fn set_id(&mut self, id: u64) {
-        self.proto.ID = id.cast()
+        self.proto.ID = id.cast();
     }
 }
 
-impl Into<LeaseGrantRequest> for EtcdLeaseGrantRequest {
+impl From<EtcdLeaseGrantRequest> for LeaseGrantRequest {
     #[inline]
-    fn into(self) -> LeaseGrantRequest {
-        self.proto
+    fn from(e: EtcdLeaseGrantRequest) -> Self {
+        e.proto
     }
 }
 
@@ -50,10 +50,7 @@ impl EtcdLeaseGrantResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Gets the lease ID for the granted lease.

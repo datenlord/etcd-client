@@ -33,7 +33,7 @@ async fn success<R: Send>(response: R, sink: UnarySink<R>) {
     sink.success(response)
         .map_err(|e| error!("failed to send response, the error is: {:?}", e))
         .map(|_| ())
-        .await
+        .await;
 }
 
 /// Send failure `gRPC` response
@@ -48,7 +48,7 @@ fn fail<R>(ctx: &RpcContext, sink: UnarySink<R>, rsc: RpcStatusCode, details: St
         .fail(rs)
         .map_err(|e| error!("failed to send response, the error is: {:?}", e))
         .map(|_| ());
-    ctx.spawn(f)
+    ctx.spawn(f);
 }
 
 impl Default for MockEtcdServer {
@@ -68,6 +68,10 @@ pub struct MockEtcdServer {
 
 impl MockEtcdServer {
     /// Create `MockEtcdServer`
+    ///
+    /// # Panics
+    ///
+    /// Will panic if build etcd server fail.
     #[must_use]
     #[inline]
     pub fn new() -> Self {
@@ -166,7 +170,7 @@ impl MockEtcd {
             _ => {
                 map.iter().for_each(|(k, v)| {
                     if k >= &key && k < &range_end {
-                        kvs.push(v.clone())
+                        kvs.push(v.clone());
                     }
                 });
             }
@@ -303,7 +307,7 @@ impl MockEtcd {
             ALL_KEYS => {
                 if key == vec![0_u8] {
                     map.values().for_each(|v| prev_kvs.push(v.clone()));
-                    map.clear()
+                    map.clear();
                 }
             }
             _ => {
@@ -478,7 +482,7 @@ impl Kv for MockEtcd {
             sink,
             RpcStatusCode::UNIMPLEMENTED,
             "Not Implemented".to_owned(),
-        )
+        );
     }
 
     fn compact(
@@ -492,7 +496,7 @@ impl Kv for MockEtcd {
             sink,
             RpcStatusCode::UNIMPLEMENTED,
             "Not Implemented".to_owned(),
-        )
+        );
     }
 }
 
@@ -565,7 +569,7 @@ impl Lease for MockEtcd {
             sink,
             RpcStatusCode::UNIMPLEMENTED,
             "Not Implemented".to_owned(),
-        )
+        );
     }
 
     fn lease_keep_alive(
@@ -580,7 +584,7 @@ impl Lease for MockEtcd {
             .fail(rs)
             .map_err(|e| error!("failed to send response, the error is: {:?}", e))
             .map(|_| ());
-        ctx.spawn(f)
+        ctx.spawn(f);
     }
 
     fn lease_time_to_live(
@@ -594,7 +598,7 @@ impl Lease for MockEtcd {
             sink,
             RpcStatusCode::UNIMPLEMENTED,
             "Not Implemented".to_owned(),
-        )
+        );
     }
 }
 
@@ -616,14 +620,8 @@ mod test {
         etcd_server.start();
         let client = Arc::new(smol::future::block_on(async {
             let endpoints = vec!["127.0.0.1:2379".to_owned()];
-            let client = Client::connect(ClientConfig {
-                endpoints,
-                auth: None,
-                cache_enable: true,
-                cache_size: 10,
-            })
-            .await
-            .unwrap_or_else(|err| {
+            let config = ClientConfig::new(endpoints, None, 10, true);
+            let client = Client::connect(config).await.unwrap_or_else(|err| {
                 panic!("failed to connect to etcd server, the error is: {}", err)
             });
             client
@@ -1097,7 +1095,7 @@ mod test {
                         .take_kvs()
                         .unwrap_or_else(|| panic!("Fail to take kvs from watch response"))
                         .take_key()
-                        .to_vec();
+                        .clone();
                     assert!((kv == key000.clone()) || (kv == key001.clone()));
                 }
             }

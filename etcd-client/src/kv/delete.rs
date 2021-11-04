@@ -34,10 +34,10 @@ impl EtcdDeleteRequest {
     }
 }
 
-impl Into<DeleteRangeRequest> for EtcdDeleteRequest {
+impl From<EtcdDeleteRequest> for DeleteRangeRequest {
     #[inline]
-    fn into(self) -> DeleteRangeRequest {
-        self.proto
+    fn from(e: EtcdDeleteRequest) -> Self {
+        e.proto
     }
 }
 
@@ -52,10 +52,7 @@ impl EtcdDeleteResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Returns the number of keys deleted by the delete range request.

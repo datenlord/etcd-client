@@ -11,12 +11,8 @@
 //!
 //! fn main() -> Result<()> {
 //!     smol::block_on(async {
-//!     let client = Client::connect(ClientConfig {
-//!         endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-//!         auth: None,
-//!         cache_size: 32,
-//!         cache_enable: true,
-//!     }).await?;
+//!     let config = ClientConfig::new(vec!["http://127.0.0.1:2379".to_owned()], None, 32, true);
+//!     let client = Client::connect(config).await?;
 //!
 //!     let key = "foo";
 //!     let value = "bar";
@@ -82,7 +78,6 @@
     clippy::module_name_repetitions, // repeation of module name in a struct name is not big deal
     clippy::multiple_crate_versions, // multi-version dependency crates is not able to fix
     clippy::panic, // allow debug_assert, panic in production code
-    clippy::unknown_clippy_lints,  // allow rustc and clippy verison mismatch
 )]
 
 pub use auth::{Auth, EtcdAuthenticateRequest, EtcdAuthenticateResponse};
@@ -178,6 +173,7 @@ macro_rules! retryable {
 }
 
 /// The notifier does nothing
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct NoopNotify;
 
@@ -347,8 +343,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("Fail to take header from response"))
                 .revision();
 
-            for v in 0..10 {
-                let _ = client
+            for v in 0_i32..10_i32 {
+                let _c = client
                     .kv()
                     .put(EtcdPutRequest::new(format!("key-{}", v), format!("{}", v)))
                     .await?;

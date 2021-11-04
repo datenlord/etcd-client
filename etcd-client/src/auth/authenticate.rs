@@ -25,10 +25,10 @@ impl EtcdAuthenticateRequest {
     }
 }
 
-impl Into<AuthenticateRequest> for EtcdAuthenticateRequest {
+impl From<EtcdAuthenticateRequest> for AuthenticateRequest {
     #[inline]
-    fn into(self) -> AuthenticateRequest {
-        self.proto
+    fn from(e: EtcdAuthenticateRequest) -> Self {
+        e.proto
     }
 }
 
@@ -43,10 +43,7 @@ impl EtcdAuthenticateResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Gets an authorized token that can be used in succeeding RPCs.

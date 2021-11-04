@@ -13,12 +13,8 @@
 //!
 //! fn main() -> Result<()> {
 //!     smol::block_on(async {
-//!         let client = Client::connect(ClientConfig {
-//!             endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-//!             auth: None,
-//!             cache_size: 32,
-//!             cache_enable: true,
-//!         }).await?;
+//!     let config = ClientConfig::new(vec!["http://127.0.0.1:2379".to_owned()], None, 32, true);
+//!     let client = Client::connect(config).await?;
 //!
 //!         let key = "foo";
 //!

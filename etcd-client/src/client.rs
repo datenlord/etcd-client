@@ -13,6 +13,7 @@ use crate::watch::EtcdWatchResponse;
 use crate::{Auth, KeyRange, Kv, Lease, Lock, Result, Watch};
 
 /// Config for establishing etcd client.
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Etcd server end points.
     pub endpoints: Vec<String>,
@@ -22,6 +23,25 @@ pub struct ClientConfig {
     pub cache_size: usize,
     /// Enable etcd client cache.
     pub cache_enable: bool,
+}
+
+impl ClientConfig {
+    /// New a client config
+    #[must_use]
+    #[inline]
+    pub fn new(
+        endpoints: Vec<String>,
+        auth: Option<(String, String)>,
+        cache_size: usize,
+        cache_enable: bool,
+    ) -> Self {
+        Self {
+            endpoints,
+            auth,
+            cache_size,
+            cache_enable,
+        }
+    }
 }
 
 /// Client is an abstraction for grouping etcd operations and managing underlying network communications.
@@ -51,15 +71,6 @@ pub struct Inner {
 impl Client {
     /// Get grpc channel.
     fn get_channel(cfg: &ClientConfig) -> Channel {
-        // let mut endpoints = Vec::with_capacity(cfg.endpoints.len());
-        // for e in cfg.endpoints.iter() {
-        //     let c = Channel::from_shared(e.to_owned())?;
-        //     endpoints.push(match &cfg.tls {
-        //         Some(tls) => c.tls_config(tls.to_owned())?,
-        //         None => c,
-        //     });
-        // }
-        // Ok(Channel::balance_list(endpoints.into_iter()))
         if cfg.endpoints.is_empty() {
             panic!("Empty etcd endpoints");
         }
@@ -92,9 +103,9 @@ impl Client {
             });
 
             if socket_address.is_ipv4() {
-                end_points = format!("{}:{}", "ipv4", end_points)
+                end_points = format!("{}:{}", "ipv4", end_points);
             } else if socket_address.is_ipv6() {
-                end_points = format!("{}:{}", "ipv6", end_points)
+                end_points = format!("{}:{}", "ipv6", end_points);
             } else {
                 panic!("unsupported etcd address: {}", socket_address)
             }

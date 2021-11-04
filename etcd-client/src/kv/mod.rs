@@ -407,11 +407,15 @@ impl EtcdKeyValue {
     /// Takes the key out of response, leaving an empty vector in its place.
     #[inline]
     pub fn take_key(&mut self) -> Vec<u8> {
-        std::mem::replace(&mut self.proto.key, vec![])
+        std::mem::take(&mut self.proto.key)
     }
 
     /// Converts the key from bytes `&[u8]` to `&str`.
     /// Leaves the original `&[u8]` in place, and creates a new string slice containing the entire content.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if convert fail.
     #[inline]
     pub fn key_str(&self) -> &str {
         std::str::from_utf8(&self.proto.key)
@@ -427,11 +431,15 @@ impl EtcdKeyValue {
     /// Takes the value out of response, leaving an empty vector in its place.
     #[inline]
     pub fn take_value(&mut self) -> Vec<u8> {
-        std::mem::replace(&mut self.proto.value, vec![])
+        std::mem::take(&mut self.proto.value)
     }
 
     /// Converts the value from bytes `&[u8]` to `&str`.
     /// Leaves the original `&[u8]` in place, and creates a new string slice containing the entire content.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if convert fail.
     #[inline]
     pub fn value_str(&self) -> &str {
         std::str::from_utf8(&self.proto.value)
@@ -557,12 +565,12 @@ impl KeyRange {
     /// Take key value
     #[inline]
     pub fn take_key(&mut self) -> Vec<u8> {
-        std::mem::replace(&mut self.key, vec![])
+        std::mem::take(&mut self.key)
     }
 
     /// Take `range_end` value
     #[inline]
     pub fn take_range_end(&mut self) -> Vec<u8> {
-        std::mem::replace(&mut self.range_end, vec![])
+        std::mem::take(&mut self.range_end)
     }
 }

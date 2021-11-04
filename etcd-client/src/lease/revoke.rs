@@ -23,10 +23,10 @@ impl EtcdLeaseRevokeRequest {
     }
 }
 
-impl Into<LeaseRevokeRequest> for EtcdLeaseRevokeRequest {
+impl From<EtcdLeaseRevokeRequest> for LeaseRevokeRequest {
     #[inline]
-    fn into(self) -> LeaseRevokeRequest {
-        self.proto
+    fn from(e: EtcdLeaseRevokeRequest) -> Self {
+        e.proto
     }
 }
 
@@ -41,10 +41,7 @@ impl EtcdLeaseRevokeResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 }
 

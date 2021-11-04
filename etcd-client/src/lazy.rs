@@ -103,7 +103,7 @@ pub struct LazyReadGuard<'a, T> {
 
 impl<'a, T> LazyReadGuard<'a, T> {
     /// Create a new `LazyReadGuard<'_, T>` from the
-    /// `tokio::sync::RwLockReadGuard<'_, Option<T>>` where the `Option<T> is
+    /// `tokio::sync::RwLockReadGuard<'_, Option<T>>` where the `Option<T>` is
     /// known to be `Some`.
     fn new(inner: RwLockReadGuard<'a, Option<T>>) -> Self {
         assert!(
@@ -135,7 +135,7 @@ pub struct LazyWriteGuard<'a, T> {
 
 impl<'a, T> LazyWriteGuard<'a, T> {
     /// Create a new `LazyWriteGuard<'_, T>` from the
-    /// `tokio::sync::RwLockWriteGuard<'_, Option<T>>` where the `Option<T> is
+    /// `tokio::sync::RwLockWriteGuard<'_, Option<T>>` where the `Option<T>` is
     /// known to be `Some`.
     fn new(inner: RwLockWriteGuard<'a, Option<T>>) -> Self {
         assert!(
@@ -192,7 +192,7 @@ mod tests {
             assert_eq!(calls.load(ORDER), 0, "Expected thunk not called.");
 
             let lock = lazy.read().await;
-            assert_eq!((*lock), true, "Expected read() == thunk().");
+            assert!(*lock, "Expected read() == thunk().");
             assert_eq!(calls.load(ORDER), 1, "Expected thunk called *once*.");
 
             // Should be able to acquire many read permits at once
@@ -223,7 +223,7 @@ mod tests {
             {
                 // need to let the write lock go out of scope before we can read
                 let mut lock = lazy.write().await;
-                assert_eq!((*lock), true, "Expected write() == thunk().");
+                assert!(*lock, "Expected write() == thunk().");
                 assert_eq!(calls.load(ORDER), 1, "Expected thunk called *once*.");
 
                 *lock = false;
@@ -231,7 +231,7 @@ mod tests {
 
             let lock = lazy.read().await;
             assert_eq!(calls.load(ORDER), 1, "Expected thunk *still* called once.");
-            assert_eq!(*lock, false, "Expected read() to have been changed.");
+            assert!(!(*lock), "Expected read() to have been changed.");
         });
     }
 
@@ -272,7 +272,7 @@ mod tests {
 
             {
                 let lock = lazy.read().await;
-                let _: Test = *lock;
+                let _l: &Test = &*lock;
                 assert_eq!(init_calls.load(ORDER), 1, "Expected init called once.");
                 assert_eq!(
                     shutdown_calls.load(ORDER),
@@ -287,7 +287,7 @@ mod tests {
 
             {
                 let lock = lazy.read().await;
-                let _: Test = *lock;
+                let _l: &Test = &*lock;
                 assert_eq!(init_calls.load(ORDER), 2, "Expected init called twice.");
                 assert_eq!(
                     shutdown_calls.load(ORDER),

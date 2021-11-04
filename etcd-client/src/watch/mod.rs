@@ -11,12 +11,8 @@
 //!
 //! fn main() -> Result<()> {
 //!     smol::block_on(async {
-//!         let client = Client::connect(ClientConfig {
-//!             endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-//!             auth: None,
-//!             cache_size: 32,
-//!             cache_enable: true,
-//!         }).await?;
+//!     let config = ClientConfig::new(vec!["http://127.0.0.1:2379".to_owned()], None, 32, true);
+//!     let client = Client::connect(config).await?;
 //!
 //!         // print out all received watch responses
 //!         let mut inbound = client.watch(KeyRange::key("foo")).await;
@@ -190,6 +186,10 @@ impl Watch {
     }
 
     /// Performs a watch operation.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if send watch request error.
     #[inline]
     pub async fn watch(
         &mut self,
@@ -218,6 +218,7 @@ impl Watch {
 }
 
 /// The kind of event.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum EventType {
     /// Put event.
@@ -248,10 +249,7 @@ impl Event {
     /// Takes the key-value pair out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_kvs(&mut self) -> Option<EtcdKeyValue> {
-        match self.proto.kv.take() {
-            Some(kv) => Some(From::from(kv)),
-            None => None,
-        }
+        self.proto.kv.take().map(From::from)
     }
 }
 
