@@ -1,6 +1,7 @@
 use crate::lease::EtcdLeaseKeepAliveRequest;
 use smol::channel::SendError;
 
+#[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 /// Error type for etcd-client
 pub enum EtcdError {

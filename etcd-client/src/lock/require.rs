@@ -39,10 +39,10 @@ impl EtcdLockRequest {
     }
 }
 
-impl Into<LockRequest> for EtcdLockRequest {
+impl From<EtcdLockRequest> for LockRequest {
     #[inline]
-    fn into(self) -> LockRequest {
-        self.proto
+    fn from(e: EtcdLockRequest) -> Self {
+        e.proto
     }
 }
 
@@ -57,10 +57,7 @@ impl EtcdLockResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Take the key out of response, leaving a empty Vec in its place.

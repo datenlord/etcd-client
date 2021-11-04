@@ -6,7 +6,7 @@ on:
   schedule: [cron: "0 0 * * *"]
 
 env:
-  CI_RUST_TOOLCHAIN: 1.47.0
+  CI_RUST_TOOLCHAIN: 1.56.1
 
 jobs:
   test:

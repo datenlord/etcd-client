@@ -68,10 +68,10 @@ impl EtcdPutRequest {
     }
 }
 
-impl Into<PutRequest> for EtcdPutRequest {
+impl From<EtcdPutRequest> for PutRequest {
     #[inline]
-    fn into(self) -> PutRequest {
-        self.proto
+    fn from(e: EtcdPutRequest) -> Self {
+        e.proto
     }
 }
 
@@ -86,19 +86,13 @@ impl EtcdPutResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Takes the previous key-value pair out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_prev_kv(&mut self) -> Option<EtcdKeyValue> {
-        match self.proto.prev_kv.take() {
-            Some(kv) => Some(From::from(kv)),
-            None => None,
-        }
+        self.proto.prev_kv.take().map(From::from)
     }
 
     /// Gets the revision of the key-value store when generating the response.

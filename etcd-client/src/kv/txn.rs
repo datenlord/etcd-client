@@ -143,10 +143,10 @@ impl Default for EtcdTxnRequest {
     }
 }
 
-impl Into<TxnRequest> for EtcdTxnRequest {
+impl From<EtcdTxnRequest> for TxnRequest {
     #[inline]
-    fn into(self) -> TxnRequest {
-        self.proto
+    fn from(e: EtcdTxnRequest) -> Self {
+        e.proto
     }
 }
 
@@ -162,15 +162,15 @@ pub enum TxnOp {
     Txn(EtcdTxnRequest),
 }
 
-impl Into<RequestOp> for TxnOp {
-    fn into(self) -> RequestOp {
-        let mut request_op = RequestOp::new();
-        match self {
-            Self::Range(req) => request_op.set_request_range(req.into()),
-            Self::Put(req) => request_op.set_request_put(req.into()),
-            Self::Delete(req) => request_op.set_request_delete_range(req.into()),
-            Self::Txn(req) => request_op.set_request_txn(req.into()),
-        };
+impl From<TxnOp> for RequestOp {
+    fn from(e: TxnOp) -> Self {
+        let mut request_op = Self::new();
+        match e {
+            TxnOp::Range(req) => request_op.set_request_range(req.into()),
+            TxnOp::Put(req) => request_op.set_request_put(req.into()),
+            TxnOp::Delete(req) => request_op.set_request_delete_range(req.into()),
+            TxnOp::Txn(req) => request_op.set_request_txn(req.into()),
+        }
         request_op
     }
 }
@@ -200,6 +200,7 @@ impl From<EtcdTxnRequest> for TxnOp {
 }
 
 /// Transaction Comparation.
+#[non_exhaustive]
 #[derive(Clone, Copy)]
 pub enum TxnCmp {
     /// Equal comparation.
@@ -212,19 +213,20 @@ pub enum TxnCmp {
     Less,
 }
 
-impl Into<Compare_CompareResult> for TxnCmp {
+impl From<TxnCmp> for Compare_CompareResult {
     #[inline]
-    fn into(self) -> Compare_CompareResult {
-        match self {
-            Self::Equal => Compare_CompareResult::EQUAL,
-            Self::NotEqual => Compare_CompareResult::NOT_EQUAL,
-            Self::Greater => Compare_CompareResult::GREATER,
-            Self::Less => Compare_CompareResult::LESS,
+    fn from(e: TxnCmp) -> Self {
+        match e {
+            TxnCmp::Equal => Self::EQUAL,
+            TxnCmp::NotEqual => Self::NOT_EQUAL,
+            TxnCmp::Greater => Self::GREATER,
+            TxnCmp::Less => Self::LESS,
         }
     }
 }
 
 /// Response transaction operation.
+#[non_exhaustive]
 pub enum TxnOpResponse {
     /// Range reponse.
     Range(EtcdRangeResponse),
@@ -263,10 +265,7 @@ impl EtcdTxnResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Returns `true` if the compare evaluated to true, and `false` otherwise.

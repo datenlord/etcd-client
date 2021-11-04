@@ -31,10 +31,10 @@ impl EtcdUnlockRequest {
     }
 }
 
-impl Into<UnlockRequest> for EtcdUnlockRequest {
+impl From<EtcdUnlockRequest> for UnlockRequest {
     #[inline]
-    fn into(self) -> UnlockRequest {
-        self.proto
+    fn from(e: EtcdUnlockRequest) -> Self {
+        e.proto
     }
 }
 
@@ -49,10 +49,7 @@ impl EtcdUnlockResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 }
 

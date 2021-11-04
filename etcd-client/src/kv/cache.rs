@@ -89,10 +89,7 @@ impl Cache {
     pub fn search_watch_id(&self, key: &[u8]) -> Option<i64> {
         let guard = pin();
         let search_result = self.watch_id_table.get(&key.to_vec(), &guard);
-        match search_result {
-            Some(value) => Some(*value),
-            None => None,
-        }
+        search_result.copied()
     }
 
     /// Gets the priority of a key in lru queue.
@@ -110,7 +107,7 @@ impl Cache {
         if self.hashtable.size() > self.hashtable.capacity().overflow_mul(6).overflow_div(10) {
             let queue = self.lru_queue.lock().await;
             if let Some(pop_value) = queue.peek() {
-                self.delete(pop_value.0.to_vec().clone(), true).await;
+                self.delete(pop_value.0.clone(), true).await;
             }
         }
     }

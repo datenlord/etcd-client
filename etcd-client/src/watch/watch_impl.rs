@@ -58,7 +58,7 @@ impl EtcdWatchRequest {
         if let Some(&mut WatchRequest_oneof_request_union::create_request(ref mut req)) =
             self.proto.request_union.as_mut()
         {
-            req.start_revision = revision.cast()
+            req.start_revision = revision.cast();
         }
     }
 
@@ -70,7 +70,7 @@ impl EtcdWatchRequest {
         if let Some(&mut WatchRequest_oneof_request_union::create_request(ref mut req)) =
             self.proto.request_union.as_mut()
         {
-            req.progress_notify = progress_notify
+            req.progress_notify = progress_notify;
         }
     }
 
@@ -82,7 +82,7 @@ impl EtcdWatchRequest {
         if let Some(&mut WatchRequest_oneof_request_union::create_request(ref mut req)) =
             self.proto.request_union.as_mut()
         {
-            req.prev_kv = prev_kv
+            req.prev_kv = prev_kv;
         }
     }
 
@@ -108,10 +108,10 @@ impl EtcdWatchRequest {
     }
 }
 
-impl Into<WatchRequest> for EtcdWatchRequest {
+impl From<EtcdWatchRequest> for WatchRequest {
     #[inline]
-    fn into(self) -> WatchRequest {
-        self.proto
+    fn from(e: EtcdWatchRequest) -> Self {
+        e.proto
     }
 }
 
@@ -126,10 +126,7 @@ impl EtcdWatchResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Gets the ID of the watcher that corresponds to the response.

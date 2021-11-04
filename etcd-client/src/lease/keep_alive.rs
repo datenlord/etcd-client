@@ -23,10 +23,10 @@ impl EtcdLeaseKeepAliveRequest {
     }
 }
 
-impl Into<LeaseKeepAliveRequest> for EtcdLeaseKeepAliveRequest {
+impl From<EtcdLeaseKeepAliveRequest> for LeaseKeepAliveRequest {
     #[inline]
-    fn into(self) -> LeaseKeepAliveRequest {
-        self.proto
+    fn from(e: EtcdLeaseKeepAliveRequest) -> Self {
+        e.proto
     }
 }
 
@@ -41,10 +41,7 @@ impl EtcdLeaseKeepAliveResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Gets the lease ID for the refreshed lease.

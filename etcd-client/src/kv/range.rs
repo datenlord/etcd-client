@@ -56,10 +56,10 @@ impl EtcdRangeRequest {
     }
 }
 
-impl Into<RangeRequest> for EtcdRangeRequest {
+impl From<EtcdRangeRequest> for RangeRequest {
     #[inline]
-    fn into(self) -> RangeRequest {
-        self.proto
+    fn from(e: EtcdRangeRequest) -> Self {
+        e.proto
     }
 }
 
@@ -82,10 +82,7 @@ impl EtcdRangeResponse {
     /// Takes the header out of response, leaving a `None` in its place.
     #[inline]
     pub fn take_header(&mut self) -> Option<ResponseHeader> {
-        match self.proto.header.take() {
-            Some(header) => Some(From::from(header)),
-            None => None,
-        }
+        self.proto.header.take().map(From::from)
     }
 
     /// Takes the key-value pairs out of response, leaving an empty vector in its place.
