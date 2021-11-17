@@ -26,4 +26,4 @@ protoc-grpcio = "3.0.0"
 
 [dev-dependencies]
 etcd-client = { path = "../etcd-client" }
-async-compat = "0.1.4"
+async-compat = "0.2.1"
