@@ -1,5 +1,5 @@
 use crate::protos::rpc;
-use utilities::Cast;
+use clippy_utilities::Cast;
 
 /// Response header.
 #[derive(Debug)]

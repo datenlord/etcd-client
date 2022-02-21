@@ -1,6 +1,6 @@
 use crate::protos::rpc::{LeaseRevokeRequest, LeaseRevokeResponse};
 use crate::ResponseHeader;
-use utilities::Cast;
+use clippy_utilities::Cast;
 
 /// Request for revoking lease.
 #[derive(Debug, Clone)]

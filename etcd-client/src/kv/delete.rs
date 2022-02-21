@@ -1,8 +1,8 @@
 use super::{EtcdKeyValue, KeyRange};
 use crate::protos::rpc::{DeleteRangeRequest, DeleteRangeResponse};
 use crate::ResponseHeader;
+use clippy_utilities::Cast;
 use protobuf::RepeatedField;
-use utilities::Cast;
 
 /// Request for deleting key-value pairs.
 #[derive(Debug, Clone)]

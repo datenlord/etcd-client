@@ -1,7 +1,7 @@
 use crate::protos::rpc::{PutRequest, PutResponse};
 use crate::EtcdKeyValue;
 use crate::ResponseHeader;
-use utilities::Cast;
+use clippy_utilities::Cast;
 
 /// Request for putting key-value.
 #[derive(Debug, Clone)]

@@ -3,8 +3,8 @@ use crate::protos::rpc::{
     RangeRequest, RangeRequest_SortOrder, RangeRequest_SortTarget, RangeResponse,
 };
 use crate::ResponseHeader;
+use clippy_utilities::Cast;
 use protobuf::RepeatedField;
-use utilities::Cast;
 
 /// Request for fetching a single key-value pair.
 #[derive(Debug, Clone)]
