@@ -7,8 +7,8 @@ use crate::protos::rpc::{
     ResponseOp, ResponseOp_oneof_response, TxnRequest, TxnResponse,
 };
 use crate::ResponseHeader;
+use clippy_utilities::Cast;
 use protobuf::RepeatedField;
-use utilities::Cast;
 
 /// Request for performing transaction operations.
 #[derive(Debug, Clone)]

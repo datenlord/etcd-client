@@ -1,6 +1,6 @@
 use crate::protos::lock::{LockRequest, LockResponse};
 use crate::ResponseHeader;
-use utilities::Cast;
+use clippy_utilities::Cast;
 
 /// Request for requiring a lock
 pub struct EtcdLockRequest {

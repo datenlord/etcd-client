@@ -82,6 +82,7 @@
 
 pub use auth::{Auth, EtcdAuthenticateRequest, EtcdAuthenticateResponse};
 pub use client::{Client, ClientConfig};
+pub use clippy_utilities::OverflowArithmetic;
 pub use error::EtcdError;
 pub use kv::{
     EtcdDeleteRequest, EtcdDeleteResponse, EtcdKeyValue, EtcdPutRequest, EtcdPutResponse,
@@ -95,7 +96,6 @@ pub use lease::{
 pub use lock::Lock;
 pub use lock::{EtcdLockRequest, EtcdLockResponse, EtcdUnlockRequest, EtcdUnlockResponse};
 pub use response_header::ResponseHeader;
-pub use utilities::OverflowArithmetic;
 pub use watch::{EtcdWatchRequest, EtcdWatchResponse, Event, EventType, Watch};
 
 use backoff::{future::Sleeper, Notify};
@@ -201,11 +201,11 @@ async fn sleep(d: Duration) {
 mod tests {
     use super::*;
     use async_compat::Compat;
+    use clippy_utilities::Cast;
     use futures::StreamExt;
     use std::collections::HashMap;
     use std::time::Duration;
     use std::time::SystemTime;
-    use utilities::Cast;
 
     const DEFAULT_ETCD_ENDPOINT1_FOR_TEST: &str = "127.0.0.1:2379";
     // Should not connect 2380 port, which will cause lock operation error.

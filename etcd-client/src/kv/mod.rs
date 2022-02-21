@@ -45,8 +45,8 @@ use std::time::Duration;
 use crate::lazy::{Lazy, Shutdown};
 use crate::protos::kv::KeyValue;
 use crate::Result as Res;
+use clippy_utilities::Cast;
 use futures::SinkExt;
-use utilities::Cast;
 
 /// Key-Value client.
 #[derive(Clone)]

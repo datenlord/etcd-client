@@ -1,6 +1,6 @@
 use crate::protos::rpc::{LeaseKeepAliveRequest, LeaseKeepAliveResponse};
 use crate::ResponseHeader;
-use utilities::Cast;
+use clippy_utilities::Cast;
 
 /// Request for refreshing lease.
 #[derive(Debug)]

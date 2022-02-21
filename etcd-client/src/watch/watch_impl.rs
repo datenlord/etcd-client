@@ -5,7 +5,7 @@ use crate::protos::rpc::{
 use crate::Event;
 use crate::KeyRange;
 use crate::ResponseHeader;
-use utilities::Cast;
+use clippy_utilities::Cast;
 
 /// Request for creating or canceling watch.
 #[derive(Debug, Clone)]

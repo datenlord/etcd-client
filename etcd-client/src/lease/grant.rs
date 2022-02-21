@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::protos::rpc::{LeaseGrantRequest, LeaseGrantResponse};
 use crate::ResponseHeader;
-use utilities::Cast;
+use clippy_utilities::Cast;
 
 /// Request for granting lease.
 #[derive(Debug, Clone)]

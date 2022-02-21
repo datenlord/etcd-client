@@ -2,13 +2,13 @@
 use super::KeyValue;
 use super::OverflowArithmetic;
 use crate::watch::EtcdWatchRequest;
+use clippy_utilities::Cast;
 use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
 use priority_queue::PriorityQueue;
 use smol::channel::Sender;
 use smol::lock::Mutex;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use utilities::Cast;
 
 /// Cache struct contains a lock-free hashTable.
 #[derive(Clone)]
