@@ -12,7 +12,6 @@ use super::rpc::{
 };
 use super::rpc_grpc::{create_kv, create_lease, create_watch, Kv, Lease, Watch};
 use async_io::Timer;
-use async_lock::RwLock;
 use futures::future::TryFutureExt;
 use futures::prelude::*;
 use grpcio::{
@@ -100,6 +99,7 @@ impl MockEtcdServer {
 }
 
 /// `KeyRange` is an abstraction for describing etcd key of various types.
+#[derive(Debug)]
 struct KeyRange {
     /// The first key of the range and should be non-empty
     key: Vec<u8>,
@@ -110,20 +110,24 @@ struct KeyRange {
 /// Mock Etcd
 #[derive(Clone)]
 struct MockEtcd {
+    /// Inner Data
+    inner: Arc<Mutex<MockEtcdInner>>,
+}
+
+/// Mocd Etcd Inner
+struct MockEtcdInner {
     /// map to store key value
-    map: Arc<RwLock<HashMap<Vec<u8>, KeyValue>>>,
-
+    map: HashMap<Vec<u8>, KeyValue>,
     /// map to store key and watch ids
-    watch: Arc<RwLock<HashMap<i64, KeyRange>>>,
-
+    watch: HashMap<i64, KeyRange>,
     /// map to store watch id and watch response senders
-    watch_response_sender: Arc<RwLock<HashMap<i64, LockedDuplexSink>>>,
-
+    watch_response_sender: HashMap<i64, LockedDuplexSink>,
     /// set to store lock name
-    lock_map: Arc<RwLock<HashSet<Vec<u8>>>>,
-
+    lock_map: HashSet<Vec<u8>>,
     /// Sequence increasing watch id
-    watch_id_counter: Arc<AtomicI64>,
+    watch_id_counter: AtomicI64,
+    /// Revision of etcd
+    revision: AtomicI64,
 }
 
 /// A locked `DuplexSink` for watch response
@@ -133,42 +137,38 @@ type LockedDuplexSink = Arc<Mutex<DuplexSink<WatchResponse>>>;
 const ALL_KEYS: &[u8] = &[0_u8];
 /// Range end to get one key
 const ONE_KEY: &[u8] = &[];
-
-impl MockEtcd {
+impl MockEtcdInner {
     /// Create `MockEtcd`
     fn new() -> Self {
         Self {
-            map: Arc::new(RwLock::new(HashMap::new())),
-            watch: Arc::new(RwLock::new(HashMap::new())),
-            watch_response_sender: Arc::new(RwLock::new(HashMap::new())),
-            lock_map: Arc::new(RwLock::new(HashSet::new())),
-            watch_id_counter: Arc::new(AtomicI64::new(0)),
+            map: HashMap::new(),
+            watch: HashMap::new(),
+            watch_response_sender: HashMap::new(),
+            lock_map: HashSet::new(),
+            watch_id_counter: AtomicI64::new(0),
+            revision: AtomicI64::new(0),
         }
     }
 
     /// Get values of keys from a `RangeRequest` to map
     #[allow(clippy::pattern_type_mismatch)]
-    async fn map_get(
-        map_arc: Arc<RwLock<HashMap<Vec<u8>, KeyValue>>>,
-        req: RangeRequest,
-    ) -> Vec<KeyValue> {
+    fn map_get(&self, req: &RangeRequest) -> Vec<KeyValue> {
         let key = req.get_key().to_vec();
         let range_end = req.get_range_end().to_vec();
         let mut kvs = vec![];
-        let map = map_arc.read().await;
         match range_end.as_slice() {
             ONE_KEY => {
-                if let Some(kv) = map.get(&key) {
+                if let Some(kv) = self.map.get(&key) {
                     kvs.push(kv.clone());
                 }
             }
             ALL_KEYS => {
                 if key == vec![0_u8] {
-                    map.values().for_each(|v| kvs.push(v.clone()));
+                    self.map.values().for_each(|v| kvs.push(v.clone()));
                 }
             }
             _ => {
-                map.iter().for_each(|(k, v)| {
+                self.map.iter().for_each(|(k, v)| {
                     if k >= &key && k < &range_end {
                         kvs.push(v.clone());
                     }
@@ -180,6 +180,7 @@ impl MockEtcd {
 
     /// Send watch response for a specific watch id to etcd client
     async fn send_watch_response_with_watch_id(
+        &self,
         sender: LockedDuplexSink,
         kv: KeyValue,
         prev_kv: Option<KeyValue>,
@@ -196,6 +197,8 @@ impl MockEtcd {
         let mut response = WatchResponse::new();
         response.set_watch_id(watch_id);
         response.set_events(RepeatedField::from_vec([event].to_vec()));
+        let header = response.mut_header();
+        header.set_revision(self.revision.load(Ordering::Relaxed));
 
         sender
             .lock()
@@ -208,23 +211,21 @@ impl MockEtcd {
     /// Send watch response to etcd client
     #[allow(clippy::pattern_type_mismatch)]
     async fn send_watch_responses(
-        watch_arc: Arc<RwLock<HashMap<i64, KeyRange>>>,
-        watch_response_hashmap_arc: Arc<RwLock<HashMap<i64, LockedDuplexSink>>>,
+        &self,
         kv: KeyValue,
         prev_kv: Option<KeyValue>,
         event_type: Event_EventType,
     ) {
         // Find all watch ids which watch this key and send watch response
-        let watch = watch_arc.read().await;
-        let watch_response_sender = watch_response_hashmap_arc.read().await;
-        for (watch_id, v) in watch.iter() {
-            let sender = watch_response_sender
+        for (watch_id, v) in &self.watch {
+            let sender = self
+                .watch_response_sender
                 .get(watch_id)
                 .unwrap_or_else(|| panic!("Fail to get watch response sender from map"));
             match v.range_end.as_slice() {
                 ONE_KEY => {
                     if v.key == kv.get_key() {
-                        Self::send_watch_response_with_watch_id(
+                        self.send_watch_response_with_watch_id(
                             Arc::clone(sender),
                             kv.clone(),
                             prev_kv.clone(),
@@ -236,7 +237,7 @@ impl MockEtcd {
                 }
                 ALL_KEYS => {
                     if v.key == vec![0_u8] {
-                        Self::send_watch_response_with_watch_id(
+                        self.send_watch_response_with_watch_id(
                             Arc::clone(sender),
                             kv.clone(),
                             prev_kv.clone(),
@@ -248,7 +249,7 @@ impl MockEtcd {
                 }
                 _ => {
                     if kv.get_key().to_vec() >= v.key && kv.get_key().to_vec() < v.range_end {
-                        Self::send_watch_response_with_watch_id(
+                        self.send_watch_response_with_watch_id(
                             Arc::clone(sender),
                             kv.clone(),
                             prev_kv.clone(),
@@ -263,55 +264,38 @@ impl MockEtcd {
     }
 
     /// Insert a key value from a `PutRequest` to map
-    async fn map_insert(
-        map_arc: Arc<RwLock<HashMap<Vec<u8>, KeyValue>>>,
-        watch_arc: Arc<RwLock<HashMap<i64, KeyRange>>>,
-        watch_response_hashmap_arc: Arc<RwLock<HashMap<i64, LockedDuplexSink>>>,
-        req: PutRequest,
-    ) -> Option<KeyValue> {
+    async fn map_insert(&mut self, req: PutRequest) -> Option<KeyValue> {
         let mut kv = KeyValue::new();
         kv.set_key(req.get_key().to_vec());
         kv.set_value(req.get_value().to_vec());
-        let mut map = map_arc.write().await;
-        let prev_kv = map.get(&req.get_key().to_vec()).cloned();
-        let insert_res = map.insert(req.get_key().to_vec(), kv.clone());
-        Self::send_watch_responses(
-            watch_arc,
-            watch_response_hashmap_arc,
-            kv.clone(),
-            prev_kv,
-            Event_EventType::PUT,
-        )
-        .await;
+        let prev_kv = self.map.get(&req.get_key().to_vec()).cloned();
+        let insert_res = self.map.insert(req.get_key().to_vec(), kv.clone());
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        self.send_watch_responses(kv.clone(), prev_kv, Event_EventType::PUT)
+            .await;
         insert_res
     }
 
     /// Delete keys from `DeleteRangeRequest` from map
     #[allow(clippy::pattern_type_mismatch)]
-    async fn map_delete(
-        map_arc: Arc<RwLock<HashMap<Vec<u8>, KeyValue>>>,
-        watch_arc: Arc<RwLock<HashMap<i64, KeyRange>>>,
-        watch_response_hashmap_arc: Arc<RwLock<HashMap<i64, LockedDuplexSink>>>,
-        req: DeleteRangeRequest,
-    ) -> Vec<KeyValue> {
+    async fn map_delete(&mut self, req: DeleteRangeRequest) -> Vec<KeyValue> {
         let key = req.get_key().to_vec();
         let range_end = req.get_range_end().to_vec();
         let mut prev_kvs = vec![];
-        let mut map = map_arc.write().await;
         match range_end.as_slice() {
             ONE_KEY => {
-                if let Some(kv) = map.remove(&key) {
+                if let Some(kv) = self.map.remove(&key) {
                     prev_kvs.push(kv);
                 }
             }
             ALL_KEYS => {
                 if key == vec![0_u8] {
-                    map.values().for_each(|v| prev_kvs.push(v.clone()));
-                    map.clear();
+                    self.map.values().for_each(|v| prev_kvs.push(v.clone()));
+                    self.map.clear();
                 }
             }
             _ => {
-                map.retain(|k, v| {
+                self.map.retain(|k, v| {
                     if k >= &key && k < &range_end {
                         prev_kvs.push(v.clone());
                         false
@@ -321,17 +305,20 @@ impl MockEtcd {
                 });
             }
         }
+        self.revision.fetch_add(1, Ordering::Relaxed);
         for kv in prev_kvs.clone() {
-            Self::send_watch_responses(
-                Arc::clone(&watch_arc),
-                Arc::clone(&watch_response_hashmap_arc),
-                kv.clone(),
-                Some(kv.clone()),
-                Event_EventType::DELETE,
-            )
-            .await;
+            self.send_watch_responses(kv.clone(), Some(kv.clone()), Event_EventType::DELETE)
+                .await;
         }
         prev_kvs
+    }
+}
+impl MockEtcd {
+    /// Create `MockEtcd`
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MockEtcdInner::new())),
+        }
     }
 }
 
@@ -342,12 +329,11 @@ impl Watch for MockEtcd {
         mut stream: RequestStream<WatchRequest>,
         sink: DuplexSink<WatchResponse>,
     ) {
-        let watch_arc = Arc::clone(&self.watch);
-        let watch_response_sender_arc = Arc::clone(&self.watch_response_sender);
-        let watch_id_arc = Arc::clone(&self.watch_id_counter);
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             let sink_arc = Arc::new(Mutex::new(sink));
             while let Some(request) = stream.next().await {
+                let mut inner = inner_clone.lock().await;
                 match request {
                     Ok(watch_request) => {
                         if watch_request.has_create_request() {
@@ -358,11 +344,10 @@ impl Watch for MockEtcd {
                                     .get_range_end()
                                     .to_vec(),
                             };
-                            let watch_id = watch_id_arc.fetch_add(1, Ordering::SeqCst);
-                            watch_arc.write().await.insert(watch_id, key_range);
-                            watch_response_sender_arc
-                                .write()
-                                .await
+                            let watch_id = inner.watch_id_counter.fetch_add(1, Ordering::Relaxed);
+                            inner.watch.insert(watch_id, key_range);
+                            inner
+                                .watch_response_sender
                                 .insert(watch_id, Arc::clone(&sink_arc));
                             let mut response = WatchResponse::new();
                             response.set_watch_id(watch_id);
@@ -378,8 +363,8 @@ impl Watch for MockEtcd {
                                 });
                         } else {
                             let watch_id = watch_request.get_cancel_request().get_watch_id();
-                            watch_arc.write().await.remove(&watch_id);
-                            watch_response_sender_arc.write().await.remove(&watch_id);
+                            inner.watch.remove(&watch_id);
+                            inner.watch_response_sender.remove(&watch_id);
 
                             let mut response = WatchResponse::new();
                             response.set_watch_id(watch_id);
@@ -414,12 +399,15 @@ impl Kv for MockEtcd {
             req.get_key(),
             req.get_range_end()
         );
-        let map_arc = Arc::clone(&self.map);
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            let kvs = Self::map_get(map_arc, req).await;
+            let inner = inner_clone.lock().await;
+            let kvs = inner.map_get(&req);
             let mut response = RangeResponse::new();
             response.set_count(kvs.len().cast());
             response.set_kvs(RepeatedField::from_vec(kvs));
+            let header = response.mut_header();
+            header.set_revision(inner.revision.load(Ordering::Relaxed));
             success(response, sink).await;
         };
 
@@ -433,15 +421,16 @@ impl Kv for MockEtcd {
             req.get_value()
         );
 
-        let map_arc = Arc::clone(&self.map);
-        let watch_arc = Arc::clone(&self.watch);
-        let watch_response_sender_arc = Arc::clone(&self.watch_response_sender);
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
+            let mut inner = inner_clone.lock().await;
             let mut response = PutResponse::new();
-            let prev = Self::map_insert(map_arc, watch_arc, watch_response_sender_arc, req).await;
+            let prev = inner.map_insert(req).await;
             if let Some(kv) = prev {
                 response.set_prev_kv(kv);
             }
+            let header = response.mut_header();
+            header.set_revision(inner.revision.load(Ordering::Relaxed));
             success(response, sink).await;
         };
         smol::spawn(task).detach();
@@ -459,18 +448,18 @@ impl Kv for MockEtcd {
             req.get_range_end()
         );
 
-        let map_arc = Arc::clone(&self.map);
-        let watch_arc = Arc::clone(&self.watch);
-        let watch_response_sender_arc = Arc::clone(&self.watch_response_sender);
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
+            let mut inner = inner_clone.lock().await;
             let mut response = DeleteRangeResponse::new();
             let get_prev = req.get_prev_kv();
-            let prev_kvs =
-                Self::map_delete(map_arc, watch_arc, watch_response_sender_arc, req).await;
+            let prev_kvs = inner.map_delete(req).await;
             response.set_deleted(prev_kvs.len().cast());
             if get_prev {
                 response.set_prev_kvs(RepeatedField::from_vec(prev_kvs));
             }
+            let header = response.mut_header();
+            header.set_revision(inner.revision.load(Ordering::Relaxed));
             success(response, sink).await;
         };
         smol::spawn(task).detach();
@@ -503,18 +492,21 @@ impl Kv for MockEtcd {
 impl Lock for MockEtcd {
     fn lock(&mut self, _ctx: RpcContext, req: LockRequest, sink: UnarySink<LockResponse>) {
         debug!("Receive lock request key={:?}", req.get_name(),);
-        let map_arc = Arc::clone(&self.lock_map);
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             loop {
-                let mut map = map_arc.write().await;
-                if map.contains(req.get_name()) {
+                let mut inner = inner_clone.lock().await;
+                if inner.lock_map.contains(req.get_name()) {
                     Timer::after(Duration::from_secs(1)).await;
-                    drop(map);
+                    drop(inner);
                 } else {
-                    map.insert(req.get_name().to_vec());
-                    drop(map);
+                    inner.lock_map.insert(req.get_name().to_vec());
+                    let revision = inner.revision.load(Ordering::Relaxed);
+                    drop(inner);
                     let mut response = LockResponse::new();
                     response.set_key(req.get_name().to_vec());
+                    let header = response.mut_header();
+                    header.set_revision(revision);
                     success(response, sink).await;
                     break;
                 }
@@ -526,15 +518,18 @@ impl Lock for MockEtcd {
 
     fn unlock(&mut self, _ctx: RpcContext, req: UnlockRequest, sink: UnarySink<UnlockResponse>) {
         debug!("Receive unlock request key={:?}", req.get_key(),);
-        let map_arc = Arc::clone(&self.lock_map);
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            let mut map = map_arc.write().await;
-            if map.contains(req.get_key()) {
-                map.remove(req.get_key());
+            let mut inner = inner_clone.lock().await;
+            if inner.lock_map.contains(req.get_key()) {
+                inner.lock_map.remove(req.get_key());
             } else {
             }
-            drop(map);
-            let response = UnlockResponse::new();
+            let revision = inner.revision.load(Ordering::Relaxed);
+            drop(inner);
+            let mut response = UnlockResponse::new();
+            let header = response.mut_header();
+            header.set_revision(revision);
             success(response, sink).await;
         };
 
@@ -639,6 +634,7 @@ mod test {
     fn unit_test() {
         smol::future::block_on(async {
             let mock_etcd = MockEtcd::new();
+            let mut inner = mock_etcd.inner.lock().await;
             // Test insert
             let mut put000 = crate::rpc::PutRequest::new();
             let mut put001 = crate::rpc::PutRequest::new();
@@ -665,96 +661,18 @@ mod test {
             put110.set_value(vec![1_u8, 1_u8, 0_u8]);
             put111.set_value(vec![1_u8, 1_u8, 1_u8]);
 
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put000.clone()
-                )
-                .await,
-                None
-            );
+            assert_eq!(inner.map_insert(put000.clone()).await, None);
 
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put001.clone()
-                )
-                .await,
-                None
-            );
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put010.clone()
-                )
-                .await,
-                None
-            );
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put011.clone()
-                )
-                .await,
-                None
-            );
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put100.clone()
-                )
-                .await,
-                None
-            );
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put101.clone()
-                )
-                .await,
-                None
-            );
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put110.clone()
-                )
-                .await,
-                None
-            );
-            assert_eq!(
-                MockEtcd::map_insert(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    put111.clone()
-                )
-                .await,
-                None
-            );
+            assert_eq!(inner.map_insert(put001.clone()).await, None);
+            assert_eq!(inner.map_insert(put010.clone()).await, None);
+            assert_eq!(inner.map_insert(put011.clone()).await, None);
+            assert_eq!(inner.map_insert(put100.clone()).await, None);
+            assert_eq!(inner.map_insert(put101.clone()).await, None);
+            assert_eq!(inner.map_insert(put110.clone()).await, None);
+            assert_eq!(inner.map_insert(put111.clone()).await, None);
             assert_eq!(
                 {
-                    let kv = MockEtcd::map_insert(
-                        Arc::clone(&mock_etcd.map),
-                        Arc::clone(&mock_etcd.watch),
-                        Arc::clone(&mock_etcd.watch_response_sender),
-                        put000.clone(),
-                    )
-                    .await;
+                    let kv = inner.map_insert(put000.clone()).await;
                     kv.unwrap().get_value().to_owned()
                 },
                 vec![0_u8, 0_u8, 0_u8]
@@ -782,35 +700,17 @@ mod test {
             range2.set_key(vec![0_u8, 1_u8, 1_u8]);
             range2.set_range_end(vec![1_u8, 1_u8, 1_u8]);
 
-            assert_eq!(
-                MockEtcd::map_get(Arc::clone(&mock_etcd.map), one_key_1.clone()).await,
-                vec![]
-            );
+            assert_eq!(inner.map_get(&one_key_1), vec![]);
             assert_eq!(
                 {
-                    let kv = MockEtcd::map_get(Arc::clone(&mock_etcd.map), one_key_2.clone()).await;
+                    let kv = inner.map_get(&one_key_2);
                     kv.get(0).unwrap().get_value().to_owned()
                 },
                 vec![0_u8, 0_u8, 0_u8]
             );
-            assert_eq!(
-                MockEtcd::map_get(Arc::clone(&mock_etcd.map), all_keys.clone())
-                    .await
-                    .len(),
-                8
-            );
-            assert_eq!(
-                MockEtcd::map_get(Arc::clone(&mock_etcd.map), range1.clone())
-                    .await
-                    .len(),
-                2
-            );
-            assert_eq!(
-                MockEtcd::map_get(Arc::clone(&mock_etcd.map), range2.clone())
-                    .await
-                    .len(),
-                4
-            );
+            assert_eq!(inner.map_get(&all_keys).len(), 8);
+            assert_eq!(inner.map_get(&range1).len(), 2);
+            assert_eq!(inner.map_get(&range2).len(), 4);
 
             // Test delete
             let mut delete_no_exist = crate::rpc::DeleteRangeRequest::new();
@@ -829,55 +729,19 @@ mod test {
             delete_all.set_key(vec![0_u8]);
             delete_all.set_range_end(vec![0_u8]);
 
-            assert_eq!(
-                MockEtcd::map_delete(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    delete_no_exist.clone()
-                )
-                .await
-                .len(),
-                0
-            );
+            assert_eq!(inner.map_delete(delete_no_exist.clone()).await.len(), 0);
             assert_eq!(
                 {
-                    let kv = MockEtcd::map_delete(
-                        Arc::clone(&mock_etcd.map),
-                        Arc::clone(&mock_etcd.watch),
-                        Arc::clone(&mock_etcd.watch_response_sender),
-                        delete_one_key.clone(),
-                    )
-                    .await;
+                    let kv = inner.map_delete(delete_one_key.clone()).await;
                     kv.get(0).unwrap().get_value().to_owned()
                 },
                 vec![1_u8, 1_u8, 1_u8]
             );
-            assert_eq!(mock_etcd.map.read().await.len(), 7);
-            assert_eq!(
-                MockEtcd::map_delete(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    delete_range.clone()
-                )
-                .await
-                .len(),
-                2
-            );
-            assert_eq!(mock_etcd.map.read().await.len(), 5);
-            assert_eq!(
-                MockEtcd::map_delete(
-                    Arc::clone(&mock_etcd.map),
-                    Arc::clone(&mock_etcd.watch),
-                    Arc::clone(&mock_etcd.watch_response_sender),
-                    delete_all.clone()
-                )
-                .await
-                .len(),
-                5
-            );
-            assert_eq!(mock_etcd.map.read().await.len(), 0);
+            assert_eq!(inner.map.len(), 7);
+            assert_eq!(inner.map_delete(delete_range.clone()).await.len(), 2);
+            assert_eq!(inner.map.len(), 5);
+            assert_eq!(inner.map_delete(delete_all.clone()).await.len(), 5);
+            assert_eq!(inner.map.len(), 0);
         });
     }
 
@@ -1052,7 +916,7 @@ mod test {
                 .watch(KeyRange::range(key000.clone(), key100.clone()))
                 .await;
 
-            let watch_id = 0;
+            let watch_id = 2; // 0-1 is used by e2e_test()
             if let Some(resp) = resp_receiver.next().await {
                 assert_eq!(
                     resp.unwrap_or_else(|e| panic!(

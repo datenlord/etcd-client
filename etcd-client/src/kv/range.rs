@@ -58,7 +58,7 @@ impl EtcdRangeRequest {
     /// Return if the range request is a single key request
     #[inline]
     pub fn is_single_key(&self) -> bool {
-        self.proto.get_range_end() == vec![]
+        self.proto.get_range_end().is_empty()
     }
 }
 

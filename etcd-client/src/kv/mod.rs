@@ -37,6 +37,7 @@ use grpcio::WriteFlags;
 use log::warn;
 use protobuf::RepeatedField;
 use smol::channel::{bounded, unbounded, Sender};
+use smol::Timer;
 use std::collections::HashMap;
 use std::str;
 use std::sync::{Arc, Mutex, Weak};
@@ -68,10 +69,12 @@ pub struct KvCache {
     cache: Arc<Cache>,
     /// Etcd watch request sender.
     watch_sender: Sender<WatchRequest>,
-    /// A channel sender to send shutdown request.
-    shutdown_task1: Sender<()>,
-    /// A channel sender to send shutdown request.
-    shutdown_task2: Sender<()>,
+    /// A channel sender to send shutdown request for task.
+    /// This task is to handle watch create and cancel request/response.
+    shutdown_watch_create_cancel_handle_task: Sender<()>,
+    /// A channel sender to send shutdown request for task.
+    /// This task is to handle watch response except create and cancel.
+    shutdown_watch_response_handle_task: Sender<()>,
     /// Arc to `Kv` that contains this `KvCache`
     kv: Weak<Kv>,
 }
@@ -98,8 +101,8 @@ impl KvCache {
         let this = Arc::new(Self {
             cache,
             watch_sender: watch_req_sender,
-            shutdown_task1: shutdown_tx1,
-            shutdown_task2: shutdown_tx2,
+            shutdown_watch_create_cancel_handle_task: shutdown_tx1,
+            shutdown_watch_response_handle_task: shutdown_tx2,
             kv,
         });
 
@@ -139,7 +142,7 @@ impl KvCache {
         let (watch_id_sender, watch_id_receiver) = bounded::<i64>(1);
         let this_clone2 = Arc::<Self>::clone(&this_clone);
         let cache_clone2 = Arc::<Cache>::clone(&cache_clone);
-        // Task that handles all the pending watch requests.
+        // This task is to handle watch create and cancel request/response.
         smol::spawn(async move {
             let mut watch_map = HashMap::<Vec<u8>, i64>::new();
             let mut shutdown_rx = shutdown_rx_1.into_future().fuse();
@@ -189,7 +192,7 @@ impl KvCache {
 
                 if let Err(e) = res {
                     warn!(
-                        "Fail to send watch request, the error is: {}, clean cache",
+                        "Fail to send watch request, the error is: {}, restart cache",
                         e
                     );
                     this_clone.restart_cache();
@@ -199,7 +202,7 @@ impl KvCache {
                 let watch_id = match watch_id_receiver.recv().await {
                     Err(e) => {
                         warn!(
-                            "Fail to receive watch id from channel, the error is {}, clean cache",
+                            "Fail to receive watch id from channel, the error is {}, restart cache",
                             e
                         );
                         this_clone.restart_cache();
@@ -218,7 +221,7 @@ impl KvCache {
         })
         .detach();
 
-        // Task that handle the watch responses from Etcd server.
+        // This task is to handle watch response except create and cancel.
         smol::spawn(async move {
             let mut shutdown_rx = shutdown_rx_2.into_future().fuse();
             loop {
@@ -239,7 +242,7 @@ impl KvCache {
                     Ok(resp) => {
                         if resp.get_created() || resp.get_canceled() {
                             if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
-                                warn!("Fail to send watch id, the error is {}, clean cache", e);
+                                warn!("Fail to send watch id, the error is {}, restart cache", e);
                                 this_clone2.restart_cache();
                                 return;
                             }
@@ -267,7 +270,7 @@ impl KvCache {
                                             .await;
                                         if let Err(e) = res {
                                             warn!(
-                                                "Fail to send watch request, the error is: {}, clean cache",
+                                                "Fail to send watch request, the error is: {}, restart cache",
                                                 e
                                             );
                                             this_clone2.restart_cache();
@@ -280,7 +283,7 @@ impl KvCache {
                     }
                     Err(e) => {
                         warn!(
-                            "Watch response contains error, the error is: {}, clean cache",
+                            "Watch response contains error, the error is: {}, restart cache",
                             e
                         );
                         this_clone2.restart_cache();
@@ -294,10 +297,12 @@ impl KvCache {
     /// Clean cache
     #[inline]
     async fn shutdown_cache(&self) -> Res<()> {
-        self.shutdown_task1.send(()).await?;
-        self.shutdown_task1.send(()).await?;
-        self.shutdown_task1.close();
-        self.shutdown_task2.close();
+        self.shutdown_watch_create_cancel_handle_task
+            .send(())
+            .await?;
+        self.shutdown_watch_response_handle_task.send(()).await?;
+        self.shutdown_watch_create_cancel_handle_task.close();
+        self.shutdown_watch_response_handle_task.close();
         Ok(())
     }
 }
@@ -364,6 +369,7 @@ impl Kv {
                 if kv.get_mod_revision() >= resp.get_revision() {
                     break;
                 }
+                Timer::after(Duration::from_millis(1)).await;
             }
         }
         Ok(resp)
@@ -405,7 +411,7 @@ impl Kv {
                         WatchRequest::create(kv.get_key().to_vec(), kv.get_mod_revision());
                     if let Err(e) = kvcache.watch_sender.send(watch_request).await {
                         warn!(
-                            "Fail to send watch request, the error is {}, clean cache",
+                            "Fail to send watch request, the error is {}, restart cache",
                             e
                         );
                         self.restart_kvcache();
@@ -415,7 +421,7 @@ impl Kv {
                     // Adjust cache size
                     if let Err(e) = kvcache.cache.adjust_cache_size(&kvcache.watch_sender).await {
                         warn!(
-                            "Fail to send watch request, the error is {}, clean cache",
+                            "Fail to send watch request, the error is {}, restart cache",
                             e
                         );
                         self.restart_kvcache();
@@ -475,6 +481,7 @@ impl Kv {
                     if kv.get_mod_revision() >= resp.get_revision() {
                         break;
                     }
+                    Timer::after(Duration::from_millis(1)).await;
                 }
             }
         }
