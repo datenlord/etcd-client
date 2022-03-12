@@ -39,9 +39,9 @@ impl EtcdDeleteRequest {
         self.proto.get_key()
     }
 
-    /// Get key of request
+    /// Wether request previous kv or not
     #[inline]
-    pub fn request_prev_kv(&self) -> bool {
+    pub const fn request_prev_kv(&self) -> bool {
         self.proto.prev_kv
     }
 }

@@ -213,6 +213,7 @@ mod tests {
 
     #[test]
     fn test_all() -> Result<()> {
+        env_logger::init();
         smol::block_on(Compat::new(async {
             test_kv().await?;
             test_transaction().await?;

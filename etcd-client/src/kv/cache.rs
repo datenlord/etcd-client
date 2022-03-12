@@ -122,15 +122,16 @@ impl Cache {
     /// Adjusts cache size if the number of value in cache has exceed the threshold(0.8 * capacity).
     /// Adjusts cache to 0.6 * capacity
     pub async fn adjust_cache_size(&self, watch_sender: &Sender<WatchRequest>) -> Res<()> {
-        let mut queue = self.lru_queue.lock().await;
-        let upper_bound = self.hashtable.capacity().overflow_mul(8).overflow_div(10);
-        let lower_bound = self.hashtable.capacity().overflow_mul(6).overflow_div(10);
+        if let Some(mut queue) = self.lru_queue.try_lock() {
+            let upper_bound = self.hashtable.capacity().overflow_mul(8).overflow_div(10);
+            let lower_bound = self.hashtable.capacity().overflow_mul(6).overflow_div(10);
 
-        if queue.len() > upper_bound {
-            while queue.len() > lower_bound {
-                if let Some(pop_value) = queue.pop() {
-                    let key = pop_value.0;
-                    watch_sender.send(WatchRequest::cancel(key)).await?;
+            if queue.len() > upper_bound {
+                while queue.len() > lower_bound {
+                    if let Some(pop_value) = queue.pop() {
+                        let key = pop_value.0;
+                        watch_sender.send(WatchRequest::cancel(key)).await?;
+                    }
                 }
             }
         }
