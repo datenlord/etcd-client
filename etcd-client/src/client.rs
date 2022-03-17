@@ -220,7 +220,7 @@ impl Client {
         watch_client.shutdown().await?;
         let mut lease_client = self.inner.lease_client.clone();
         lease_client.shutdown().await?;
-        self.inner.kv_client.shutdown().await?;
+        self.inner.kv_client.shutdown().await;
         Ok(())
     }
 }

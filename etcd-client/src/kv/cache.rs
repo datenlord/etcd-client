@@ -1,7 +1,7 @@
 //! The implementation for Etcd cache.
 use super::KeyValue;
+use super::LocalWatchRequest;
 use super::OverflowArithmetic;
-use super::WatchRequest;
 use crate::Result as Res;
 use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
 use priority_queue::PriorityQueue;
@@ -89,7 +89,9 @@ impl Cache {
             );
             (succeed, old_value.is_none())
         };
-        self.lru_queue.lock().await.push(key, Self::get_priority());
+        if res.0 {
+            self.lru_queue.lock().await.push(key, Self::get_priority());
+        }
         res
     }
 
@@ -100,6 +102,14 @@ impl Cache {
 
     /// Remove a `key` from cache totally
     pub async fn remove(&self, key: &[u8]) {
+        // Adopt the following sequence to keep consistency between hashtable and lru_queue
+        //
+        // | Sequence         | Sequence         | Sequence         | Sequence         | Sequence         | Sequence         |
+        // | insert hashtable | insert hashtable | remove lru_queue | insert hashtable | remove lru_queue | remove lru_queue |
+        // | insert lru_queue | remove lru_queue | insert hashtable | remove lru_queue | insert hashtable | remove hashtable |
+        // | remove lru_queue | insert lru_queue | insert lru_queue | remove hashtable | remove hashtable | insert hashtable |
+        // | remove hashtable | remove hashtable | remove hashtable | insert lru_queue | insert lru_queue | insert lru_queue |
+        // | Good             | <----------  key in lru_queue not in hashtable, but it is OK  -------->   | Good             |
         self.lru_queue.lock().await.remove(key);
         self.hashtable.remove(key);
     }
@@ -121,7 +131,7 @@ impl Cache {
 
     /// Adjusts cache size if the number of value in cache has exceed the threshold(0.8 * capacity).
     /// Adjusts cache to 0.6 * capacity
-    pub async fn adjust_cache_size(&self, watch_sender: &Sender<WatchRequest>) -> Res<()> {
+    pub async fn adjust_cache_size(&self, watch_sender: &Sender<LocalWatchRequest>) -> Res<()> {
         if let Some(mut queue) = self.lru_queue.try_lock() {
             let upper_bound = self.hashtable.capacity().overflow_mul(8).overflow_div(10);
             let lower_bound = self.hashtable.capacity().overflow_mul(6).overflow_div(10);
@@ -130,7 +140,7 @@ impl Cache {
                 while queue.len() > lower_bound {
                     if let Some(pop_value) = queue.pop() {
                         let key = pop_value.0;
-                        watch_sender.send(WatchRequest::cancel(key)).await?;
+                        watch_sender.send(LocalWatchRequest::cancel(key)).await?;
                     }
                 }
             }

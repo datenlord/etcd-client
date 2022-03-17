@@ -268,6 +268,8 @@ mod tests {
             1,
             "Receive wrong watch events from etcd server"
         );
+        clean_etcd(&client).await?;
+        client.shutdown().await?;
         Ok(())
     }
 
@@ -326,12 +328,16 @@ mod tests {
             .lock()
             .unlock(EtcdUnlockRequest::new(key_bytes2))
             .await?;
+        clean_etcd(&client).await?;
+        client.shutdown().await?;
         Ok(())
     }
 
     async fn test_transaction() -> Result<()> {
         let client = build_etcd_client().await?;
         test_compose(&client).await?;
+        clean_etcd(&client).await?;
+        client.shutdown().await?;
         Ok(())
     }
 
@@ -396,6 +402,8 @@ mod tests {
         let client = build_etcd_client().await?;
         test_list_prefix(&client).await?;
         test_range_query(&client).await?;
+        clean_etcd(&client).await?;
+        client.shutdown().await?;
         Ok(())
     }
 
@@ -548,5 +556,10 @@ mod tests {
         })
         .await?;
         Ok(client)
+    }
+    async fn clean_etcd(client: &Client) -> Result<()> {
+        let req = EtcdDeleteRequest::new(KeyRange::all());
+        client.kv().delete(req).await?;
+        Ok(())
     }
 }

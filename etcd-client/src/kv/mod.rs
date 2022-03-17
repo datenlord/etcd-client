@@ -21,7 +21,7 @@ pub use txn::{EtcdTxnRequest, EtcdTxnResponse, TxnCmp, TxnOpResponse};
 
 use super::OverflowArithmetic;
 use crate::protos::kv::Event_EventType;
-use crate::protos::rpc::RangeResponse;
+use crate::protos::rpc::{RangeResponse, WatchRequest};
 use crate::protos::rpc_grpc::{KvClient, WatchClient};
 use crate::retryable;
 use crate::CURRENT_INTERVAL_ENV_KEY;
@@ -31,14 +31,15 @@ use crate::INITIAL_INTERVAL_VALUE;
 use crate::MAX_ELAPSED_TIME_ENV_KEY;
 use crate::MAX_ELAPSED_TIME_VALUE;
 use backoff::ExponentialBackoff;
+use either::{Left, Right};
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
-use grpcio::WriteFlags;
+use grpcio::{Error, StreamingCallSink, WriteFlags};
 use log::warn;
 use protobuf::RepeatedField;
-use smol::channel::{bounded, unbounded, Sender};
+use smol::channel::{unbounded, Sender};
 use smol::Timer;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -68,13 +69,10 @@ pub struct KvCache {
     /// Etcd client cache.
     cache: Arc<Cache>,
     /// Etcd watch request sender.
-    watch_sender: Sender<WatchRequest>,
+    watch_sender: Sender<LocalWatchRequest>,
     /// A channel sender to send shutdown request for task.
-    /// This task is to handle watch create and cancel request/response.
-    shutdown_watch_create_cancel_handle_task: Sender<()>,
-    /// A channel sender to send shutdown request for task.
-    /// This task is to handle watch response except create and cancel.
-    shutdown_watch_response_handle_task: Sender<()>,
+    /// This task is to handle watch request/response.
+    shutdown_watch_task: Sender<()>,
     /// Arc to `Kv` that contains this `KvCache`
     kv: Weak<Kv>,
 }
@@ -95,22 +93,19 @@ impl KvCache {
         let cache = Arc::new(Cache::new(etcd_cache_size));
 
         let cache_clone = Arc::<Cache>::clone(&cache);
-        let (watch_req_sender, watch_req_receiver) = unbounded::<WatchRequest>();
-        let (shutdown_tx1, shutdown_rx_1) = unbounded();
-        let (shutdown_tx2, shutdown_rx_2) = unbounded();
+        let (watch_req_sender, watch_req_receiver) = unbounded::<LocalWatchRequest>();
+        let (shutdown_tx, shutdown_rx) = unbounded();
         let this = Arc::new(Self {
             cache,
             watch_sender: watch_req_sender,
-            shutdown_watch_create_cancel_handle_task: shutdown_tx1,
-            shutdown_watch_response_handle_task: shutdown_tx2,
+            shutdown_watch_task: shutdown_tx,
             kv,
         });
 
         Self::start_watch_task(
             Arc::<Self>::clone(&this),
             cache_clone,
-            shutdown_rx_1,
-            shutdown_rx_2,
+            shutdown_rx,
             watch_req_receiver,
             watch_client,
         );
@@ -131,27 +126,25 @@ impl KvCache {
     fn start_watch_task(
         this_clone: Arc<Self>,
         cache_clone: Arc<Cache>,
-        shutdown_rx_1: Receiver<()>,
-        shutdown_rx_2: Receiver<()>,
-        watch_req_receiver: Receiver<WatchRequest>,
+        shutdown_rx: Receiver<()>,
+        watch_req_receiver: Receiver<LocalWatchRequest>,
         watch_client: &WatchClient,
     ) {
         let (mut client_req_sender, mut client_resp_receiver) = watch_client
             .watch()
             .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
-        let (watch_id_sender, watch_id_receiver) = bounded::<i64>(1);
-        let this_clone2 = Arc::<Self>::clone(&this_clone);
-        let cache_clone2 = Arc::<Cache>::clone(&cache_clone);
-        // This task is to handle watch create and cancel request/response.
         smol::spawn(async move {
             let mut watch_map = HashMap::<Vec<u8>, i64>::new();
-            let mut shutdown_rx = shutdown_rx_1.into_future().fuse();
+            let mut shutdown_rx = shutdown_rx.into_future().fuse();
+            let mut watch_request_queue = VecDeque::<LocalWatchRequest>::new();
+            let mut has_pending_watch_request = false;
+            let mut processing_req = None;
 
             loop {
-                let watch_req = futures::select! {
-                    req_opt = watch_req_receiver.recv().fuse() => {
-                        if let Ok(req) = req_opt {
-                            req
+                let message = futures::select! {
+                    watch_req_opt = watch_req_receiver.recv().fuse() => {
+                        if let Ok(req) = watch_req_opt {
+                            Left(req)
                         } else {
                             warn!("Failed to receive watch request");
                             this_clone.restart_cache();
@@ -159,151 +152,190 @@ impl KvCache {
                         }
 
                     }
-                    _ = shutdown_rx => return
-
-                };
-                let processing_key = watch_req.key;
-                // If key is already watched, skip create watch request
-                // If cancel watch request has been sent(watch id == -1), skip cancel watch request
-                // If key is not watched, skip cancel watch request
-                if (watch_req.is_create && watch_map.contains_key(&processing_key))
-                    || (!watch_req.is_create && !watch_map.contains_key(&processing_key))
-                {
-                    continue;
-                }
-
-                let request = if watch_req.is_create {
-                    let mut req = EtcdWatchRequest::create(KeyRange::key(processing_key.clone()));
-                    req.set_start_revision(watch_req.revision.cast());
-                    req
-                } else {
-                    let req = EtcdWatchRequest::cancel(
-                        (*watch_map
-                            .get(&processing_key)
-                            .unwrap_or_else(|| panic!("key {:?} doesn't exist", processing_key)))
-                        .cast(),
-                    );
-                    req
-                };
-
-                let res = client_req_sender
-                    .send((request.into(), WriteFlags::default()))
-                    .await;
-
-                if let Err(e) = res {
-                    warn!(
-                        "Fail to send watch request, the error is: {}, restart cache",
-                        e
-                    );
-                    this_clone.restart_cache();
-                    return;
-                }
-                // Wait until etcd server returns watch id.
-                let watch_id = match watch_id_receiver.recv().await {
-                    Err(e) => {
-                        warn!(
-                            "Fail to receive watch id from channel, the error is {}, restart cache",
-                            e
-                        );
-                        this_clone.restart_cache();
-                        return;
-                    }
-                    Ok(id) => id,
-                };
-                // Watch request can only be create or cancel.
-                if watch_req.is_create {
-                    watch_map.insert(processing_key, watch_id);
-                } else {
-                    watch_map.remove(&processing_key);
-                    cache_clone.remove(&processing_key).await;
-                }
-            }
-        })
-        .detach();
-
-        // This task is to handle watch response except create and cancel.
-        smol::spawn(async move {
-            let mut shutdown_rx = shutdown_rx_2.into_future().fuse();
-            loop {
-                let watch_resp = futures::select! {
-                    resp_opt = client_resp_receiver.next().fuse() => {
-                        if let Some(resp) = resp_opt {
-                            resp
+                    watch_resp_opt = client_resp_receiver.next().fuse() => {
+                        if let Some(resp) = watch_resp_opt {
+                            Right(resp)
                         } else {
                             warn!("failed to receive watch response from etcd");
-                            this_clone2.restart_cache();
+                            this_clone.restart_cache();
                             return;
                         }
-                    },
+                    }
                     _ = shutdown_rx => return
+
                 };
 
-                match watch_resp {
-                    Ok(resp) => {
-                        if resp.get_created() || resp.get_canceled() {
-                            if let Err(e) = watch_id_sender.send(resp.get_watch_id()).await {
-                                warn!("Fail to send watch id, the error is {}, restart cache", e);
-                                this_clone2.restart_cache();
-                                return;
+                match message {
+                    Left(watch_req) => {
+                        let watch_key = &watch_req.key;
+                        // If key is already watched, skip create watch request
+                        // If key is not watched, skip cancel watch request
+                        if (watch_req.is_create && watch_map.contains_key(watch_key))
+                            || (!watch_req.is_create && !watch_map.contains_key(watch_key))
+                        {
+                            continue;
+                        }
+                        watch_request_queue.push_back(watch_req);
+
+                        if !has_pending_watch_request {
+                            if let Some(req) = watch_request_queue.pop_front() {
+                                processing_req = Some(req);
+                                has_pending_watch_request = true;
+                                let res = Self::send_watch_requset(processing_req.as_ref(), &watch_map, &mut client_req_sender).await;
+                                if let Err(e) = res {
+                                    warn!(
+                                        "Fail to send watch request, the error is: {}, restart cache",
+                                        e
+                                    );
+                                    this_clone.restart_cache();
+                                    return;
+                                }
                             }
-                        } else {
-                            let events = resp.get_events().to_vec();
-                            for event in events {
-                                if event.get_field_type() == Event_EventType::PUT {
-                                    cache_clone2
-                                        .insert_or_update(
-                                            event.get_kv().get_key().to_vec(),
-                                            event.get_kv().clone(),
-                                        ).await;
-                                } else {
-                                    cache_clone2
-                                        .mark_delete(
-                                            event.get_kv().get_key().to_vec(),
-                                            event.get_kv().clone(),
-                                        ).await;
-                                    {
-                                        let res = this_clone2
-                                            .watch_sender
-                                            .send(WatchRequest::cancel(
-                                                event.get_kv().get_key().to_vec(),
-                                            ))
-                                            .await;
-                                        if let Err(e) = res {
+                        }
+                    },
+                    Right(watch_resp) => {
+                        match watch_resp {
+                            Ok(resp) => {
+                                if resp.get_created() || resp.get_canceled() {
+                                    if let Some(req) = processing_req.take() {
+                                        let watch_id = resp.get_watch_id();
+                                        let is_create = resp.get_created();
+                                        if is_create != req.is_create {
                                             warn!(
-                                                "Fail to send watch request, the error is: {}, restart cache",
-                                                e
+                                                "processing request is_create {} doesn't match response is_create {},
+                                                 restart cache",
+                                                is_create, req.is_create
                                             );
-                                            this_clone2.restart_cache();
+                                            this_clone.restart_cache();
                                             return;
+                                        }
+                                        let processing_key = req.key.clone();
+                                        if is_create {
+                                            watch_map.insert(processing_key, watch_id);
+                                        } else {
+                                            watch_map.remove(&processing_key);
+                                            cache_clone.remove(&processing_key).await;
+                                        }
+                                        has_pending_watch_request = false;
+                                        if let Some(req) = watch_request_queue.pop_front() {
+                                            processing_req = Some(req);
+                                            has_pending_watch_request = true;
+                                            let res = Self::send_watch_requset(processing_req.as_ref(), &watch_map, &mut client_req_sender).await;
+                                            if let Err(e) = res {
+                                                warn!(
+                                                    "Fail to send watch request, the error is: {}, restart cache",
+                                                    e
+                                                );
+                                                this_clone.restart_cache();
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        warn!(
+                                            "Receive watch response when no watch request is sent, the watch response is: {:?}, restart cache",
+                                            resp
+                                        );
+                                        this_clone.restart_cache();
+                                        return;
+                                    }
+                                } else {
+                                    let events = resp.get_events().to_vec();
+                                    for event in events {
+                                        if event.get_field_type() == Event_EventType::PUT {
+                                            cache_clone
+                                                .insert_or_update(
+                                                    event.get_kv().get_key().to_vec(),
+                                                    event.get_kv().clone(),
+                                                ).await;
+                                        } else {
+                                            cache_clone
+                                                .mark_delete(
+                                                    event.get_kv().get_key().to_vec(),
+                                                    event.get_kv().clone(),
+                                                ).await;
+                                            {
+                                                let res = this_clone
+                                                    .watch_sender
+                                                    .send(LocalWatchRequest::cancel(
+                                                        event.get_kv().get_key().to_vec(),
+                                                    ))
+                                                    .await;
+                                                if let Err(e) = res {
+                                                    warn!(
+                                                        "Fail to send watch request, the error is: {}, restart cache",
+                                                        e
+                                                    );
+                                                    this_clone.restart_cache();
+                                                    return;
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
+                            Err(e) => {
+                                warn!(
+                                    "Watch response contains error, the error is: {}, restart cache",
+                                    e
+                                );
+                                this_clone.restart_cache();
+                                return;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Watch response contains error, the error is: {}, restart cache",
-                            e
-                        );
-                        this_clone2.restart_cache();
-                        return;
-                    }
+                    },
                 }
             }
         })
         .detach();
     }
-    /// Clean cache
+
+    /// Send watch request to etcd server
+    async fn send_watch_requset(
+        watch_req: Option<&LocalWatchRequest>,
+        watch_map: &HashMap<Vec<u8>, i64>,
+        client_req_sender: &mut StreamingCallSink<WatchRequest>,
+    ) -> Result<(), Error> {
+        if let Some(req) = watch_req {
+            let processing_key = req.key.clone();
+            let request = if req.is_create {
+                let mut etcd_req = EtcdWatchRequest::create(KeyRange::key(processing_key));
+                etcd_req.set_start_revision(req.revision.cast());
+                etcd_req
+            } else {
+                let etcd_req = EtcdWatchRequest::cancel(
+                    (*watch_map
+                        .get(&processing_key)
+                        .unwrap_or_else(|| panic!("key {:?} doesn't exist", processing_key)))
+                    .cast(),
+                );
+                etcd_req
+            };
+
+            client_req_sender
+                .send((request.into(), WriteFlags::default()))
+                .await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Shutdown cache task
     #[inline]
-    async fn shutdown_cache(&self) -> Res<()> {
-        self.shutdown_watch_create_cancel_handle_task
-            .send(())
-            .await?;
-        self.shutdown_watch_response_handle_task.send(()).await?;
-        self.shutdown_watch_create_cancel_handle_task.close();
-        self.shutdown_watch_response_handle_task.close();
-        Ok(())
+    async fn shutdown_cache(&self) {
+        if !self.shutdown_watch_task.is_closed() {
+            if let Err(e) = self.shutdown_watch_task.send(()).await {
+                // Shouldn't reach here because we have already check the channel is not closed.
+                panic!("Shutdown cache error, the error is: {}", e);
+            }
+            self.shutdown_watch_task.close();
+        }
+    }
+}
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        smol::block_on(async {
+            self.shutdown_cache().await;
+        });
     }
 }
 impl Kv {
@@ -408,7 +440,7 @@ impl Kv {
                 if succeed && is_insert {
                     // Creates a new watch request and adds to the send queue.
                     let watch_request =
-                        WatchRequest::create(kv.get_key().to_vec(), kv.get_mod_revision());
+                        LocalWatchRequest::create(kv.get_key().to_vec(), kv.get_mod_revision());
                     if let Err(e) = kvcache.watch_sender.send(watch_request).await {
                         warn!(
                             "Fail to send watch request, the error is {}, restart cache",
@@ -505,23 +537,17 @@ impl Kv {
     /// Shut down the running watch task, if any.
     /// This should only be called when there are
     /// no other threads accessing the cache.
-    ///
-    /// # Errors
-    ///
-    /// Will return `Err` if kv is shutdown.
     #[inline]
-    pub async fn shutdown(&self) -> Res<()> {
+    pub async fn shutdown(&self) {
         if let Some(ref kvcache) = self.kvcache {
-            kvcache.load().shutdown_cache().await
-        } else {
-            Ok(())
+            kvcache.load().shutdown_cache().await;
         }
     }
 }
 
 /// Watch request struct
 #[derive(Debug, Clone)]
-pub struct WatchRequest {
+pub struct LocalWatchRequest {
     /// Request key
     key: Vec<u8>,
     /// Revision to start watch
@@ -531,7 +557,7 @@ pub struct WatchRequest {
     is_create: bool,
 }
 
-impl WatchRequest {
+impl LocalWatchRequest {
     /// Create watch request
     fn create(key: Vec<u8>, revision: i64) -> Self {
         Self {
