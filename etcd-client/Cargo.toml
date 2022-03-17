@@ -20,6 +20,7 @@ async-trait = "0.1"
 backoff = { version = "0.3.0", features = ["futures"] }
 bytes = "0.5"
 clippy-utilities = "0.1.0"
+either = "1.6.1"
 futures = "0.3.5"
 grpcio = { version = "0.9.1", default-features = false, features = ["protobuf-codec"] }
 http = "0.2"
