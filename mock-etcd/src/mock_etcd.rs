@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use utilities::Cast;
+use utilities::{Cast, OverflowArithmetic};
 
 /// Help function to send success `gRPC` response
 async fn success<R: Send>(response: R, sink: UnarySink<R>) {
@@ -268,9 +268,10 @@ impl MockEtcdInner {
         let mut kv = KeyValue::new();
         kv.set_key(req.get_key().to_vec());
         kv.set_value(req.get_value().to_vec());
+        let prev_revision = self.revision.fetch_add(1, Ordering::Relaxed);
+        kv.set_mod_revision(prev_revision.overflow_add(1));
         let prev_kv = self.map.get(&req.get_key().to_vec()).cloned();
         let insert_res = self.map.insert(req.get_key().to_vec(), kv.clone());
-        self.revision.fetch_add(1, Ordering::Relaxed);
         self.send_watch_responses(kv.clone(), prev_kv, Event_EventType::PUT)
             .await;
         insert_res
@@ -742,6 +743,13 @@ mod test {
             assert_eq!(inner.map.len(), 5);
             assert_eq!(inner.map_delete(delete_all.clone()).await.len(), 5);
             assert_eq!(inner.map.len(), 0);
+            // test kv revision
+            inner.map_insert(put000.clone()).await;
+            let prev_val1 = inner.map_insert(put000.clone()).await;
+            let revision1 = prev_val1.unwrap().get_mod_revision();
+            let prev_val2 = inner.map_insert(put000.clone()).await;
+            let revision2 = prev_val2.unwrap().get_mod_revision();
+            assert_eq!(revision1 + 1, revision2);
         });
     }
 
