@@ -132,7 +132,7 @@ impl KvCache {
     ) {
         let (mut client_req_sender, mut client_resp_receiver) = watch_client
             .watch()
-            .unwrap_or_else(|e| panic!("failed to send watch commend, the response is: {}", e));
+            .unwrap_or_else(|e| panic!("failed to start watch channel, the error is: {}", e));
         smol::spawn(async move {
             let mut watch_map = HashMap::<Vec<u8>, i64>::new();
             let mut shutdown_rx = shutdown_rx.into_future().fuse();

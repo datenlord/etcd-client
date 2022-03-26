@@ -263,6 +263,40 @@ impl MockEtcdInner {
         }
     }
 
+    /// Send watch response if client falls behind
+    /// Etcd will send all changes from requested revision until latest revision.
+    /// For `MockEtcd`, just latest revision is sent. This already meets test requirement.
+    async fn catch_up_revision(
+        &self,
+        sender: LockedDuplexSink,
+        watch_id: i64,
+        watch_request: WatchRequest,
+    ) {
+        let request_revision = watch_request.get_create_request().get_start_revision();
+        let request_key = watch_request.get_create_request().get_key().to_vec();
+
+        if let Some(kv) = self.map.get(&request_key) {
+            if request_revision < kv.get_mod_revision() {
+                let mut event = Event::new();
+                event.set_field_type(Event_EventType::PUT);
+                event.set_kv(kv.clone());
+
+                let mut response = WatchResponse::new();
+                response.set_watch_id(watch_id);
+                response.set_events(RepeatedField::from_vec([event].to_vec()));
+                let header = response.mut_header();
+                header.set_revision(self.revision.load(Ordering::Relaxed));
+
+                sender
+                    .lock()
+                    .await
+                    .send((response, WriteFlags::default()))
+                    .await
+                    .unwrap_or_else(|e| panic!("Fail to send watch response, the error is {}", e));
+            }
+        }
+    }
+
     /// Insert a key value from a `PutRequest` to map
     async fn map_insert(&mut self, req: PutRequest) -> Option<KeyValue> {
         let mut kv = KeyValue::new();
@@ -362,6 +396,9 @@ impl Watch for MockEtcd {
                                 .unwrap_or_else(|e| {
                                     panic!("Fail to send watch response, the error is {}", e)
                                 });
+                            inner
+                                .catch_up_revision(Arc::clone(&sink_arc), watch_id, watch_request)
+                                .await;
                         } else {
                             let watch_id = watch_request.get_cancel_request().get_watch_id();
                             inner.watch.remove(&watch_id);
