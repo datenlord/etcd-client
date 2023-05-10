@@ -6,9 +6,11 @@
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+    clippy::same_name_method
 )]
 pub mod rpc_grpc;
+
 // Ignore format and lint to generated code
 #[rustfmt::skip]
 #[allow(
@@ -18,9 +20,11 @@ pub mod rpc_grpc;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+    clippy::same_name_method
 )]
 pub mod rpc;
+
 // Ignore format and lint to generated code
 #[rustfmt::skip]
 #[allow(
@@ -29,9 +33,11 @@ pub mod rpc;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+    clippy::same_name_method
 )]
 pub mod auth;
+
 // Ignore format and lint to generated code
 #[rustfmt::skip]
 #[allow(
@@ -40,9 +46,11 @@ pub mod auth;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+    clippy::same_name_method
 )]
 pub mod kv;
+
 // Ignore format and lint to generated code
 #[rustfmt::skip]
 #[allow(
@@ -51,9 +59,11 @@ pub mod kv;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+    clippy::same_name_method
 )]
 pub mod lock;
+
 // Ignore format and lint to generated code
 #[rustfmt::skip]
 #[allow(
@@ -62,6 +72,7 @@ pub mod lock;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+    clippy::same_name_method
 )]
 pub mod lock_grpc;

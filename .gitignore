@@ -2,3 +2,8 @@
 **/*.rs.bk
 Cargo.lock
 .idea/
+etcd-client/src/protos/*
+!etcd-client/src/protos/mod.rs
+mock-etcd/src/*
+!mock-etcd/lib.rs
+!mock-etcd/mock_etcd.rs

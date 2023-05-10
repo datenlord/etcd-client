@@ -168,8 +168,6 @@ impl Shutdown for WatchTunnel {
 /// Watch client.
 #[derive(Clone)]
 pub struct Watch {
-    /// Etcd watch client provides watch realted operations.
-    client: WatchClient,
     /// A tunnel used to communicate with Etcd server for watch operations.
     tunnel: Arc<Lazy<WatchTunnel>>,
 }
@@ -177,12 +175,9 @@ pub struct Watch {
 impl Watch {
     /// Create a new `WatchClient`.
     pub(crate) fn new(client: WatchClient) -> Self {
-        let tunnel = {
-            let client = client.clone();
-            Arc::new(Lazy::new(move || WatchTunnel::new(&client.clone())))
-        };
+        let tunnel = { Arc::new(Lazy::new(move || WatchTunnel::new(&client))) };
 
-        Self { client, tunnel }
+        Self { tunnel }
     }
 
     /// Performs a watch operation.
@@ -250,6 +245,12 @@ impl Event {
     #[inline]
     pub fn take_kvs(&mut self) -> Option<EtcdKeyValue> {
         self.proto.kv.take().map(From::from)
+    }
+
+    /// Get the type of event
+    #[inline]
+    pub fn event_type(&self) -> EventType {
+        EventType::from(self.proto.get_field_type())
     }
 }
 

@@ -272,7 +272,7 @@ mod tests {
 
             {
                 let lock = lazy.read().await;
-                let _l: &Test = &*lock;
+                let _: &Test = &*lock;
                 assert_eq!(init_calls.load(ORDER), 1, "Expected init called once.");
                 assert_eq!(
                     shutdown_calls.load(ORDER),
@@ -287,7 +287,7 @@ mod tests {
 
             {
                 let lock = lazy.read().await;
-                let _l: &Test = &*lock;
+                let _: &Test = &*lock;
                 assert_eq!(init_calls.load(ORDER), 2, "Expected init called twice.");
                 assert_eq!(
                     shutdown_calls.load(ORDER),

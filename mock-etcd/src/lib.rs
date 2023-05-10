@@ -28,7 +28,7 @@
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
 )]
 #![allow(
     // Some explicitly allowed Clippy lints, must have clear reason to allow
@@ -37,6 +37,12 @@
     clippy::module_name_repetitions, // repeation of module name in a struct name is not big deal
     clippy::multiple_crate_versions, // multi-version dependency crates is not able to fix
     clippy::panic, // allow debug_assert, panic in production code
+    clippy::shadow_same, //it’s a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method,
+    clippy::separated_literal_suffix,
+    clippy::mod_module_files, // TODO: fix code structure to pass this lint
 )]
 
 // Ignore format and lint to generated code
@@ -47,7 +53,13 @@
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+clippy::shadow_same, //it’s a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method,
+    clippy::separated_literal_suffix,
+clippy::mod_module_files, // TODO: fix code structure to pass this lint
 )]
 mod auth;
 // Ignore format and lint to generated code
@@ -58,7 +70,13 @@ mod auth;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+clippy::shadow_same, //it’s a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method,
+    clippy::separated_literal_suffix,
+clippy::mod_module_files, // TODO: fix code structure to pass this lint
 )]
 mod kv;
 // Ignore format and lint to generated code
@@ -70,7 +88,13 @@ mod kv;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+clippy::shadow_same, //it’s a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method,
+    clippy::separated_literal_suffix,
+clippy::mod_module_files, // TODO: fix code structure to pass this lint
 )]
 mod rpc;
 // Ignore format and lint to generated code
@@ -81,7 +105,13 @@ mod rpc;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+clippy::shadow_same, //it’s a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method,
+    clippy::separated_literal_suffix,
+clippy::mod_module_files, // TODO: fix code structure to pass this lint
 )]
 mod rpc_grpc;
 // Ignore format and lint to generated code
@@ -92,7 +122,13 @@ mod rpc_grpc;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+clippy::shadow_same, //it’s a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method,
+    clippy::separated_literal_suffix,
+clippy::mod_module_files, // TODO: fix code structure to pass this lint
 )]
 mod lock_grpc;
 // Ignore format and lint to generated code
@@ -103,7 +139,13 @@ mod lock_grpc;
     clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo
+    clippy::cargo,
+clippy::shadow_same, //it’s a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method,
+    clippy::separated_literal_suffix,
+clippy::mod_module_files, // TODO: fix code structure to pass this lint
 )]
 mod lock;
 
