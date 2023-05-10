@@ -77,7 +77,13 @@
     clippy::implicit_return, // actually omitting the return keyword is idiomatic Rust code
     clippy::module_name_repetitions, // repeation of module name in a struct name is not big deal
     clippy::multiple_crate_versions, // multi-version dependency crates is not able to fix
-    clippy::panic, // allow debug_assert, panic in production code
+    clippy::panic, // allow debug_assert, panic in production code  
+    clippy::shadow_same, // shadow a common pattern in Rust code
+    clippy::shadow_unrelated,
+    clippy::shadow_reuse,
+    clippy::same_name_method, // generated proto has same name func on trait and struct
+    clippy::separated_literal_suffix, // conflict with unsepatated
+    clippy::mod_module_files, // conflict with self_named_module_files
 )]
 
 pub use auth::{Auth, EtcdAuthenticateRequest, EtcdAuthenticateResponse};

@@ -33,6 +33,7 @@ impl EtcdTxnRequest {
 
     /// Adds a version compare.
     #[inline]
+    #[must_use]
     pub fn when_version(mut self, key_range: KeyRange, cmp: TxnCmp, version: usize) -> Self {
         let compare_result: Compare_CompareResult = cmp.into();
         let compare = Compare {
@@ -49,6 +50,7 @@ impl EtcdTxnRequest {
 
     /// Adds a create revision compare.
     #[inline]
+    #[must_use]
     pub fn when_create_revision(
         mut self,
         key_range: KeyRange,
@@ -70,6 +72,7 @@ impl EtcdTxnRequest {
 
     /// Adds a mod revision compare.
     #[inline]
+    #[must_use]
     pub fn when_mod_revision(mut self, key_range: KeyRange, cmp: TxnCmp, revision: usize) -> Self {
         let compare_result: Compare_CompareResult = cmp.into();
         let compare = Compare {
@@ -86,6 +89,7 @@ impl EtcdTxnRequest {
 
     /// Adds a value compare.
     #[inline]
+    #[must_use]
     pub fn when_value<V>(mut self, key_range: KeyRange, cmp: TxnCmp, value: V) -> Self
     where
         V: Into<Vec<u8>>,
@@ -105,6 +109,7 @@ impl EtcdTxnRequest {
 
     /// If compare success, then execute the specified operations.
     #[inline]
+    #[must_use]
     pub fn and_then<O>(mut self, op: O) -> Self
     where
         O: Into<TxnOp>,
@@ -115,6 +120,7 @@ impl EtcdTxnRequest {
 
     /// If compare fail, then execute the specified operations.
     #[inline]
+    #[must_use]
     pub fn or_else<O>(mut self, op: O) -> Self
     where
         O: Into<TxnOp>,

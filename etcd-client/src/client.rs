@@ -71,9 +71,8 @@ pub struct Inner {
 impl Client {
     /// Get grpc channel.
     fn get_channel(cfg: &ClientConfig) -> Channel {
-        if cfg.endpoints.is_empty() {
-            panic!("Empty etcd endpoints");
-        }
+        assert!(!cfg.endpoints.is_empty(), "Empty etcd endpoints");
+
         let mut end_points = cfg.endpoints.join(",");
         let env = Arc::new(EnvBuilder::new().build());
         if cfg.endpoints.len() > 1 {

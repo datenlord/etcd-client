@@ -175,9 +175,7 @@ pub struct Watch {
 impl Watch {
     /// Create a new `WatchClient`.
     pub(crate) fn new(client: WatchClient) -> Self {
-        let tunnel = {
-            Arc::new(Lazy::new(move || WatchTunnel::new(&client)))
-        };
+        let tunnel = { Arc::new(Lazy::new(move || WatchTunnel::new(&client))) };
 
         Self { tunnel }
     }
