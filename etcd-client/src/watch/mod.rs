@@ -15,9 +15,9 @@
 //!     let client = Client::connect(config).await?;
 //!
 //!         // print out all received watch responses
-//!         let mut inbound = client.watch(KeyRange::key("foo")).await;
+//!         let mut inbound = client.watch(KeyRange::key("foo")).await.unwrap();
 //!         smol::spawn(async move {
-//!             while let Some(resp) = inbound.next().await {
+//!             while let Some(resp) = inbound.recv().await {
 //!                 println!("watch response: {:?}", resp);
 //!             }
 //!         });
@@ -46,7 +46,6 @@ use std::time::Duration;
 
 use async_broadcast::{InactiveReceiver, Receiver as BroadcastRx, Sender as BroadcastTx};
 use async_std::channel::bounded;
-use async_trait::async_trait;
 use crossbeam_queue::SegQueue;
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
@@ -57,7 +56,7 @@ use smol::Task;
 
 pub use watch_impl::{EtcdWatchRequest, EtcdWatchResponse};
 
-use crate::lazy::{Lazy, Shutdown};
+use crate::lazy::Lazy;
 use crate::protos::kv;
 use crate::protos::rpc::WatchRequest;
 use crate::protos::rpc_grpc::WatchClient;
@@ -454,11 +453,9 @@ impl WatchTunnel {
             shared: shared3,
         }
     }
-}
 
-#[async_trait]
-impl Shutdown for WatchTunnel {
-    async fn shutdown(&mut self) -> Result<()> {
+    /// shutdown the watch client
+    async fn shutdown(&self) -> Result<()> {
         self.shared.shutdown.send(()).await?;
         Ok(())
     }
@@ -594,7 +591,7 @@ impl Watch {
         // If we implemented `Shutdown` for this, callers would need it in scope in
         // order to call this method.
 
-        //todo:shutdown
+        self.tunnel.shutdown().await?;
         Ok(())
     }
 }

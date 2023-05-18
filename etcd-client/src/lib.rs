@@ -11,32 +11,32 @@
 //!
 //! fn main() -> Result<()> {
 //!     smol::block_on(async {
-//!     let config = ClientConfig::new(vec!["http://127.0.0.1:2379".to_owned()], None, 32, true);
-//!     let client = Client::connect(config).await?;
-//!
-//!     let key = "foo";
-//!     let value = "bar";
-//!
-//!     // Put a key-value pair
-//!     let resp = client.kv().put(EtcdPutRequest::new(key, value)).await?;
-//!
-//!     println!("Put Response: {:?}", resp);
-//!
-//!     // Get the key-value pair
-//!     let resp = client
-//!         .kv()
-//!         .range(EtcdRangeRequest::new(KeyRange::key(key)))
-//!         .await?;
-//!     println!("Range Response: {:?}", resp);
-//!
-//!     // Delete the key-valeu pair
-//!     let resp = client
-//!         .kv()
-//!         .delete(EtcdDeleteRequest::new(KeyRange::key(key)))
-//!         .await?;
-//!     println!("Delete Response: {:?}", resp);
-//!
-//!     Ok(())
+//!         let config =
+//!             ClientConfig::new(vec!["http://127.0.0.1:2379".to_owned()], None, 32, true);
+//!         let client = Client::connect(config).await?;
+//!     
+//!         // print out all received watch responses
+//!         let mut inbound = client.watch(KeyRange::key("foo")).await.unwrap();
+//!         smol::spawn(async move {
+//!             while let Some(resp) = inbound.recv().await {
+//!                 println!("watch response: {:?}", resp);
+//!             }
+//!         })
+//!         .detach();
+//!         
+//!         let key = "foo";
+//!         client.kv().put(EtcdPutRequest::new(key, "bar")).await?;
+//!         client.kv().put(EtcdPutRequest::new(key, "baz")).await?;
+//!         client
+//!             .kv()
+//!             .delete(EtcdDeleteRequest::new(KeyRange::key(key)))
+//!             .await?;
+//!         
+//!         // not necessary, but will cleanly shut down the long-running tasks
+//!         // spawned by the client
+//!         client.shutdown().await.unwrap();
+//!         
+//!         Ok(())
 //!     })
 //! }
 //! ```
@@ -203,7 +203,12 @@ async fn sleep(d: Duration) {
     smol::Timer::after(d).await;
 }
 
-#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::too_many_lines)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    dead_code
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,27 +234,14 @@ mod tests {
         smol::block_on(Compat::new(async {
             test_kv().await?;
             test_transaction().await?;
+            test_watch("test_all").await?;
             test_lock().await?;
-            test_watch().await?;
+
             Ok(())
         }))
     }
 
-    #[test]
-    fn test_watch_wrap() -> Result<()> {
-        set_var("RUST_LOG", "debug");
-
-        env_logger::try_init().unwrap_or_else(|e| {
-            log::debug!("env_logger try init failed, err:{}", e);
-        });
-
-        smol::block_on(Compat::new(async {
-            test_watch().await?;
-            Ok(())
-        }))
-    }
-
-    async fn test_watch() -> Result<()> {
+    async fn test_watch(key_prefix: &str) -> Result<()> {
         async fn watch_one(watch_key: &str, client: Client) {
             log::debug!("watch_one");
             let mut watch = client
@@ -293,29 +285,33 @@ mod tests {
         log::debug!("test_watch");
 
         let client = build_etcd_client().await?;
+        let key1 = format!("{}41_foo1", key_prefix);
+        let key2 = format!("{}42_foo1", key_prefix);
 
         client
             .kv()
-            .put(EtcdPutRequest::new("41_foo1", "baz1"))
+            .put(EtcdPutRequest::new(key1.as_str(), "baz1"))
             .await?;
         client
             .kv()
-            .put(EtcdPutRequest::new("42_foo1", "baz2"))
+            .put(EtcdPutRequest::new(key2.as_str(), "baz2"))
             .await?;
         log::debug!("prev put");
         {
             let client = client.clone();
+            let key1 = key1.clone();
+            let key2 = key2.clone();
             smol::spawn(async move {
                 smol::Timer::after(Duration::from_secs(1)).await;
                 log::debug!("put");
                 client
                     .kv()
-                    .put(EtcdPutRequest::new("41_foo1", "baz3"))
+                    .put(EtcdPutRequest::new(key1.as_str(), "baz3"))
                     .await
                     .unwrap();
                 client
                     .kv()
-                    .put(EtcdPutRequest::new("41_foo2", "baz3"))
+                    .put(EtcdPutRequest::new(key2.as_str(), "baz3"))
                     .await
                     .unwrap();
                 smol::Timer::after(Duration::from_secs(1)).await;
@@ -323,37 +319,50 @@ mod tests {
                 log::debug!("delete");
                 client
                     .kv()
-                    .delete(EtcdDeleteRequest::new(KeyRange::key("41_foo1")))
+                    .delete(EtcdDeleteRequest::new(KeyRange::key(key1.as_str())))
                     .await
                     .unwrap();
                 client
                     .kv()
-                    .delete(EtcdDeleteRequest::new(KeyRange::key("41_foo2")))
+                    .delete(EtcdDeleteRequest::new(KeyRange::key(key2.as_str())))
                     .await
                     .unwrap();
             })
             .detach();
         }
 
-        let watch_key = "41_foo1";
-        let watch_key2 = "41_foo2";
-        let client2 = client.clone();
-        let join = smol::spawn(async move {
-            watch_one(watch_key, client2).await;
-        });
-        let client3 = client.clone();
-        let join2 = smol::spawn(async move {
-            watch_one(watch_key2, client3).await;
-        });
-        let client4 = client.clone();
-        let join3 = smol::spawn(async move {
-            watch_one(watch_key, client4).await;
-        });
-        watch_one(watch_key2, client.clone()).await;
+        let join = {
+            let client = client.clone();
+            let watchkey = key1.clone();
+            smol::spawn(async move {
+                watch_one(watchkey.as_str(), client).await;
+            })
+        };
+        let join2 = {
+            let client = client.clone();
+            let watchkey = key1.clone();
+            smol::spawn(async move {
+                watch_one(watchkey.as_str(), client).await;
+            })
+        };
+        let join3 = {
+            let client = client.clone();
+            let watchkey = key2.clone();
+            smol::spawn(async move {
+                watch_one(watchkey.as_str(), client).await;
+            })
+        };
+        let join4 = {
+            let client = client.clone();
+            let watchkey = key2.clone();
+            smol::spawn(async move {
+                watch_one(watchkey.as_str(), client).await;
+            })
+        };
         join.await;
         join2.await;
         join3.await;
-
+        join4.await;
         clean_etcd(&client).await?;
         client.shutdown().await?;
 
@@ -361,6 +370,8 @@ mod tests {
     }
 
     async fn test_lock() -> Result<()> {
+        log::debug!("test_lock");
+
         // 1. Lock on "ABC"
         let client = build_etcd_client().await?;
         let lease_id = client
@@ -421,6 +432,7 @@ mod tests {
     }
 
     async fn test_transaction() -> Result<()> {
+        log::debug!("test_transaction");
         let client = build_etcd_client().await?;
         test_compose(&client).await?;
         clean_etcd(&client).await?;
@@ -486,6 +498,7 @@ mod tests {
     }
 
     async fn test_kv() -> Result<()> {
+        log::debug!("test_kv");
         let client = build_etcd_client().await?;
         test_list_prefix(&client).await?;
         test_range_query(&client).await?;
