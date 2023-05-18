@@ -220,7 +220,12 @@ mod tests {
 
     #[test]
     fn test_all() -> Result<()> {
-        env_logger::init();
+        set_var("RUST_LOG", "debug");
+
+        env_logger::try_init().unwrap_or_else(|e| {
+            log::debug!("env_logger try init failed, err:{}", e);
+        });
+
         smol::block_on(Compat::new(async {
             test_kv().await?;
             test_transaction().await?;
@@ -233,7 +238,10 @@ mod tests {
     #[test]
     fn test_watch_wrap() -> Result<()> {
         set_var("RUST_LOG", "debug");
-        env_logger::init();
+
+        env_logger::try_init().unwrap_or_else(|e| {
+            log::debug!("env_logger try init failed, err:{}", e);
+        });
 
         smol::block_on(Compat::new(async {
             test_watch().await?;

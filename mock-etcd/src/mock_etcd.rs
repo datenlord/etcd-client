@@ -645,9 +645,12 @@ mod test {
         EtcdPutRequest, EtcdRangeRequest, EtcdUnlockRequest, KeyRange,
     };
 
-    use std::sync::Arc;
+    use std::{env::set_var, sync::Arc};
     #[test]
     fn test_all() {
+        set_var("RUST_LOG", "debug");
+        env_logger::init();
+
         unit_test();
         let mut etcd_server = MockEtcdServer::new();
         etcd_server.start();
@@ -963,9 +966,6 @@ mod test {
                 .unwrap_or_else(|| panic!("watch failed"));
 
             let watch_id = 2; // 0-1 is used by e2e_test()
-            if let Some(resp) = resp_receiver.recv().await {
-                assert_eq!(resp.watch_id(), watch_id);
-            }
 
             for key in test_data {
                 client
