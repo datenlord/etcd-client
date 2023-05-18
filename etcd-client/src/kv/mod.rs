@@ -40,6 +40,8 @@ use protobuf::RepeatedField;
 use smol::channel::{unbounded, Sender};
 use smol::Timer;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::fmt::{Debug, Display};
 use std::str;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -672,11 +674,28 @@ impl From<KeyValue> for EtcdKeyValue {
 }
 
 /// `KeyRange` is an abstraction for describing etcd key of various types.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct KeyRange {
     /// The first key of the range and should be non-empty
     key: Vec<u8>,
     /// The key following the last key of the range
     range_end: Vec<u8>,
+}
+
+impl Display for KeyRange {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Write strictly the first element into the supplied output
+        // stream: `f`. Returns `fmt::Result` which indicates whether the
+        // operation succeeded or failed. Note that `write!` uses syntax which
+        // is very similar to `println!`.
+        write!(
+            f,
+            "keyrange( begin:{}, end:{} )",
+            str::from_utf8(&self.key).unwrap_or("not utf8"),
+            str::from_utf8(&self.range_end).unwrap_or("not utf8")
+        )
+    }
 }
 
 impl KeyRange {

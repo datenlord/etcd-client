@@ -644,7 +644,7 @@ mod test {
         Client, ClientConfig, EtcdDeleteRequest, EtcdLeaseGrantRequest, EtcdLockRequest,
         EtcdPutRequest, EtcdRangeRequest, EtcdUnlockRequest, KeyRange,
     };
-    use futures::StreamExt;
+
     use std::sync::Arc;
     #[test]
     fn test_all() {
@@ -959,18 +959,12 @@ mod test {
 
             let mut resp_receiver = client
                 .watch(KeyRange::range(key000.clone(), key100.clone()))
-                .await;
+                .await
+                .unwrap_or_else(|| panic!("watch failed"));
 
             let watch_id = 2; // 0-1 is used by e2e_test()
-            if let Some(resp) = resp_receiver.next().await {
-                assert_eq!(
-                    resp.unwrap_or_else(|e| panic!(
-                        "Fail to get watch response, the error is {}",
-                        e
-                    ))
-                    .watch_id(),
-                    watch_id
-                );
+            if let Some(resp) = resp_receiver.recv().await {
+                assert_eq!(resp.watch_id(), watch_id);
             }
 
             for key in test_data {
@@ -991,10 +985,8 @@ mod test {
             assert_eq!(resp.take_prev_kvs().get(0).unwrap().value(), key000);
 
             for _x in 0..3 {
-                if let Some(resp) = resp_receiver.next().await {
-                    let mut watch_resp = resp.unwrap_or_else(|e| {
-                        panic!("Fail to get watch response, the error is {}", e)
-                    });
+                if let Some(resp) = resp_receiver.recv().await {
+                    let mut watch_resp = resp;
                     assert_eq!(watch_resp.watch_id(), watch_id);
                     let mut events = watch_resp.take_events();
                     let event = events

@@ -203,13 +203,14 @@ async fn sleep(d: Duration) {
     smol::Timer::after(d).await;
 }
 
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::too_many_lines)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_compat::Compat;
     use clippy_utilities::Cast;
-    use futures::StreamExt;
     use std::collections::HashMap;
+    use std::env::set_var;
     use std::time::Duration;
     use std::time::SystemTime;
 
@@ -229,7 +230,60 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn test_watch_wrap() -> Result<()> {
+        set_var("RUST_LOG", "debug");
+        env_logger::init();
+
+        smol::block_on(Compat::new(async {
+            test_watch().await?;
+            Ok(())
+        }))
+    }
+
     async fn test_watch() -> Result<()> {
+        async fn watch_one(watch_key: &str, client: Client) {
+            log::debug!("watch_one");
+            let mut watch = client
+                .watch(KeyRange::key(watch_key))
+                .await
+                .unwrap_or_else(|| panic!("watch failed"));
+
+            log::debug!("watch 1");
+            {
+                let mut resp = watch
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("failed to get watch"));
+                let mut resp_events = resp.take_events();
+                assert_eq!(resp_events.len(), 1);
+                assert_eq!(resp_events[0].event_type(), EventType::Put);
+                let kvs = resp_events[0]
+                    .take_kvs()
+                    .unwrap_or_else(|| panic!("should have kv"));
+                assert_eq!(kvs.key_str(), watch_key);
+                assert_eq!(kvs.value_str(), "baz3");
+            }
+            log::debug!("watch 1 done");
+            log::debug!("watch 2");
+            {
+                let mut resp = watch
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("failed to get watch"));
+                let mut resp_events = resp.take_events();
+                assert_eq!(resp_events.len(), 1);
+                assert_eq!(resp_events[0].event_type(), EventType::Delete);
+                let kvs = &mut resp_events[0]
+                    .take_kvs()
+                    .unwrap_or_else(|| panic!("should have kv"));
+                assert_eq!(kvs.key_str(), watch_key);
+                // assert_eq!(kvs.value_str(),"baz3");
+            }
+            log::debug!("watch 2 done");
+        }
+        log::debug!("test_watch");
+
         let client = build_etcd_client().await?;
 
         client
@@ -240,42 +294,61 @@ mod tests {
             .kv()
             .put(EtcdPutRequest::new("42_foo1", "baz2"))
             .await?;
+        log::debug!("prev put");
+        {
+            let client = client.clone();
+            smol::spawn(async move {
+                smol::Timer::after(Duration::from_secs(1)).await;
+                log::debug!("put");
+                client
+                    .kv()
+                    .put(EtcdPutRequest::new("41_foo1", "baz3"))
+                    .await
+                    .unwrap();
+                client
+                    .kv()
+                    .put(EtcdPutRequest::new("41_foo2", "baz3"))
+                    .await
+                    .unwrap();
+                smol::Timer::after(Duration::from_secs(1)).await;
+
+                log::debug!("delete");
+                client
+                    .kv()
+                    .delete(EtcdDeleteRequest::new(KeyRange::key("41_foo1")))
+                    .await
+                    .unwrap();
+                client
+                    .kv()
+                    .delete(EtcdDeleteRequest::new(KeyRange::key("41_foo2")))
+                    .await
+                    .unwrap();
+            })
+            .detach();
+        }
 
         let watch_key = "41_foo1";
-        let mut response = client.watch(KeyRange::key(watch_key)).await;
-        assert_eq!(
-            response
-                .next()
-                .await
-                .unwrap_or_else(|| panic!("Fail to receive reponse from client"))
-                .unwrap_or_else(|e| { panic!("failed to get watch response, the error is: {}", e) })
-                .watch_id(),
-            0,
-            "Receive wrong watch response from etcd server"
-        );
+        let watch_key2 = "41_foo2";
+        let client2 = client.clone();
+        let join = smol::spawn(async move {
+            watch_one(watch_key, client2).await;
+        });
+        let client3 = client.clone();
+        let join2 = smol::spawn(async move {
+            watch_one(watch_key2, client3).await;
+        });
+        let client4 = client.clone();
+        let join3 = smol::spawn(async move {
+            watch_one(watch_key, client4).await;
+        });
+        watch_one(watch_key2, client.clone()).await;
+        join.await;
+        join2.await;
+        join3.await;
 
-        client
-            .kv()
-            .put(EtcdPutRequest::new("41_foo1", "baz3"))
-            .await?;
-        let mut watch_response = response
-            .next()
-            .await
-            .unwrap_or_else(|| panic!("Fail to receive reponse from client"))
-            .unwrap_or_else(|e| panic!("failed to get watch response, the error is: {}", e));
-
-        assert_eq!(
-            watch_response.watch_id(),
-            0,
-            "Receive wrong watch response from etcd server"
-        );
-        assert_eq!(
-            watch_response.take_events().len(),
-            1,
-            "Receive wrong watch events from etcd server"
-        );
         clean_etcd(&client).await?;
         client.shutdown().await?;
+
         Ok(())
     }
 
