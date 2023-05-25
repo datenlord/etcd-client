@@ -193,8 +193,12 @@ impl Client {
     }
 
     /// Perform a watch operation
+    ///
+    ///  # Errors
+    ///
+    /// etcd error: client closed
     #[inline]
-    pub async fn watch(&self, key_range: KeyRange) -> Option<SingleWatchEventReceiver> {
+    pub async fn watch(&self, key_range: KeyRange) -> Result<SingleWatchEventReceiver> {
         let mut client = self.inner.watch_client.clone();
         client.watch(key_range).await
     }

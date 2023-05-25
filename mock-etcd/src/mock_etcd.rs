@@ -963,7 +963,7 @@ mod test {
             let mut resp_receiver = client
                 .watch(KeyRange::range(key000.clone(), key100.clone()))
                 .await
-                .unwrap_or_else(|| panic!("watch failed"));
+                .unwrap_or_else(|e| panic!("watch failed, err {e}"));
 
             let watch_id = 2; // 0-1 is used by e2e_test()
 
@@ -985,19 +985,23 @@ mod test {
             assert_eq!(resp.take_prev_kvs().get(0).unwrap().value(), key000);
 
             for _x in 0..3 {
-                if let Some(resp) = resp_receiver.recv().await {
-                    let mut watch_resp = resp;
-                    assert_eq!(watch_resp.watch_id(), watch_id);
-                    let mut events = watch_resp.take_events();
-                    let event = events
-                        .get_mut(0)
-                        .unwrap_or_else(|| panic!("Fail to take events from watch response"));
-                    let kv = event
-                        .take_kvs()
-                        .unwrap_or_else(|| panic!("Fail to take kvs from watch response"))
-                        .take_key()
-                        .clone();
-                    assert!((kv == key000.clone()) || (kv == key001.clone()));
+                match resp_receiver.recv().await {
+                    Ok(mut watch_resp) => {
+                        assert_eq!(watch_resp.watch_id(), watch_id);
+                        let mut events = watch_resp.take_events();
+                        let event = events
+                            .get_mut(0)
+                            .unwrap_or_else(|| panic!("Fail to take events from watch response"));
+                        let kv = event
+                            .take_kvs()
+                            .unwrap_or_else(|| panic!("Fail to take kvs from watch response"))
+                            .take_key()
+                            .clone();
+                        assert!((kv == key000.clone()) || (kv == key001.clone()));
+                    }
+                    Err(e) => {
+                        panic!("failed to receive watch response, the error is {}", e)
+                    }
                 }
             }
         });

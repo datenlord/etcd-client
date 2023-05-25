@@ -98,7 +98,7 @@ struct LeaseKeepAliveTunnel {
     req_sender: Sender<EtcdLeaseKeepAliveRequest>,
     /// A channel receiver to receive keep alive response.
     resp_receiver: Option<Receiver<Result<EtcdLeaseKeepAliveResponse>>>,
-    /// A channel sender to send shutdowm request.
+    /// A channel sender to send shutdown request.
     shutdown: Option<Sender<()>>,
 }
 

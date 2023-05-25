@@ -30,7 +30,7 @@ priority-queue = "1.0.5"
 protobuf = "2.16.2"
 smol = "1.2.4"
 thiserror = "1.0"
-crossbeam-queue = "0.3.1"
+crossbeam-queue = "0.3.8"
 async-broadcast = "0.5.1"
 
 [dev-dependencies]

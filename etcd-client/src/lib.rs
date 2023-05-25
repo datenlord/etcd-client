@@ -18,7 +18,7 @@
 //!         // print out all received watch responses
 //!         let mut inbound = client.watch(KeyRange::key("foo")).await.unwrap();
 //!         smol::spawn(async move {
-//!             while let Some(resp) = inbound.recv().await {
+//!             while let Ok(resp) = inbound.recv().await {
 //!                 println!("watch response: {:?}", resp);
 //!             }
 //!         })
@@ -224,6 +224,14 @@ mod tests {
     //const DEFAULT_ETCD_ENDPOINT2_FOR_TEST: &str = "127.0.0.1:2380";
 
     #[test]
+    /// Here we used a blocking and sequential structure to run the tests
+    ///  because using separate test functions would result in parallel
+    ///  execution of different tests when we run the global test.
+    /// However, some etcd operations conflict with each other,
+    ///  such as deleting all keys.
+    /// Even when using prefixes to differentiate the scope of
+    ///  different test operations, the operation that deletes all keys still
+    ///  has a global impact and would read the results of other tests.
     fn test_all() -> Result<()> {
         set_var("RUST_LOG", "debug");
 
@@ -242,47 +250,49 @@ mod tests {
     }
 
     async fn test_watch(key_prefix: &str) -> Result<()> {
+        /// For one task to watch put and deletion of a key to check is it support multi watchers
         async fn watch_one(watch_key: &str, client: Client) {
-            log::debug!("watch_one");
             let mut watch = client
                 .watch(KeyRange::key(watch_key))
                 .await
-                .unwrap_or_else(|| panic!("watch failed"));
+                .unwrap_or_else(|e| panic!("watch failed, err:{}", e));
 
-            log::debug!("watch 1");
             {
                 let mut resp = watch
                     .recv()
                     .await
-                    .unwrap_or_else(|| panic!("failed to get watch"));
+                    .unwrap_or_else(|e| panic!("failed to get watch, err:{}", e));
                 let mut resp_events = resp.take_events();
-                assert_eq!(resp_events.len(), 1);
-                assert_eq!(resp_events[0].event_type(), EventType::Put);
+                assert_eq!(resp_events.len(), 1, "There should be one event");
+                assert_eq!(
+                    resp_events[0].event_type(),
+                    EventType::Put,
+                    "The event should be put"
+                );
                 let kvs = resp_events[0]
                     .take_kvs()
-                    .unwrap_or_else(|| panic!("should have kv"));
-                assert_eq!(kvs.key_str(), watch_key);
-                assert_eq!(kvs.value_str(), "baz3");
+                    .unwrap_or_else(|| panic!("There should be kv"));
+                assert_eq!(kvs.key_str(), watch_key, "The key should be watched key");
+                assert_eq!(kvs.value_str(), "baz3", "The value should be baz3");
             }
-            log::debug!("watch 1 done");
-            log::debug!("watch 2");
             {
                 let mut resp = watch
                     .recv()
                     .await
-                    .unwrap_or_else(|| panic!("failed to get watch"));
+                    .unwrap_or_else(|e| panic!("Failed to get watch, err:{}", e));
                 let mut resp_events = resp.take_events();
-                assert_eq!(resp_events.len(), 1);
-                assert_eq!(resp_events[0].event_type(), EventType::Delete);
+                assert_eq!(resp_events.len(), 1, "There should be one event");
+                assert_eq!(
+                    resp_events[0].event_type(),
+                    EventType::Delete,
+                    "The event should be delete"
+                );
                 let kvs = &mut resp_events[0]
                     .take_kvs()
                     .unwrap_or_else(|| panic!("should have kv"));
-                assert_eq!(kvs.key_str(), watch_key);
-                // assert_eq!(kvs.value_str(),"baz3");
+                assert_eq!(kvs.key_str(), watch_key, "The key should be watched key");
             }
-            log::debug!("watch 2 done");
         }
-        log::debug!("test_watch");
 
         let client = build_etcd_client().await?;
         let key1 = format!("{}41_foo1", key_prefix);
@@ -296,14 +306,15 @@ mod tests {
             .kv()
             .put(EtcdPutRequest::new(key2.as_str(), "baz2"))
             .await?;
-        log::debug!("prev put");
+
+        // Spawn an async task to do put operation and delete operation,
+        //  which should be watched by the watch task.
         {
             let client = client.clone();
             let key1 = key1.clone();
             let key2 = key2.clone();
             smol::spawn(async move {
                 smol::Timer::after(Duration::from_secs(1)).await;
-                log::debug!("put");
                 client
                     .kv()
                     .put(EtcdPutRequest::new(key1.as_str(), "baz3"))
@@ -315,8 +326,6 @@ mod tests {
                     .await
                     .unwrap();
                 smol::Timer::after(Duration::from_secs(1)).await;
-
-                log::debug!("delete");
                 client
                     .kv()
                     .delete(EtcdDeleteRequest::new(KeyRange::key(key1.as_str())))
@@ -331,38 +340,39 @@ mod tests {
             .detach();
         }
 
-        let join = {
-            let client = client.clone();
-            let watchkey = key1.clone();
-            smol::spawn(async move {
-                watch_one(watchkey.as_str(), client).await;
-            })
-        };
-        let join2 = {
-            let client = client.clone();
-            let watchkey = key1.clone();
-            smol::spawn(async move {
-                watch_one(watchkey.as_str(), client).await;
-            })
-        };
-        let join3 = {
-            let client = client.clone();
-            let watchkey = key2.clone();
-            smol::spawn(async move {
-                watch_one(watchkey.as_str(), client).await;
-            })
-        };
-        let join4 = {
-            let client = client.clone();
-            let watchkey = key2.clone();
-            smol::spawn(async move {
-                watch_one(watchkey.as_str(), client).await;
-            })
-        };
-        join.await;
-        join2.await;
-        join3.await;
-        join4.await;
+        // Spawn 4 async tasks to watch the put and delete operation of the key.
+        // Every 2 tasks watch the same key.
+        let joiners = vec![
+            {
+                let client = client.clone();
+                let watchkey = key1.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+            {
+                let client = client.clone();
+                let watchkey = key1.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+            {
+                let client = client.clone();
+                let watchkey = key2.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+            {
+                let client = client.clone();
+                let watchkey = key2.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+        ];
+        futures::future::join_all(joiners).await;
         clean_etcd(&client).await?;
         client.shutdown().await?;
 

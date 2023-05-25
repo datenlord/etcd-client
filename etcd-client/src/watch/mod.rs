@@ -17,7 +17,7 @@
 //!         // print out all received watch responses
 //!         let mut inbound = client.watch(KeyRange::key("foo")).await.unwrap();
 //!         smol::spawn(async move {
-//!             while let Some(resp) = inbound.recv().await {
+//!             while let Ok(resp) = inbound.recv().await {
 //!                 println!("watch response: {:?}", resp);
 //!             }
 //!         });
@@ -50,28 +50,64 @@ use crossbeam_queue::SegQueue;
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
 use futures::{SinkExt, TryFutureExt};
-use grpcio::{StreamingCallSink, WriteFlags};
-use smol::channel::{unbounded, Sender};
+use grpcio::{ClientDuplexReceiver, StreamingCallSink, WriteFlags};
+use smol::channel::{unbounded, Receiver, Sender};
 use smol::Task;
 
 pub use watch_impl::{EtcdWatchRequest, EtcdWatchResponse};
 
 use crate::lazy::Lazy;
 use crate::protos::kv;
-use crate::protos::rpc::WatchRequest;
+use crate::protos::rpc::{WatchRequest, WatchResponse};
 use crate::protos::rpc_grpc::WatchClient;
-use crate::EtcdKeyValue;
 use crate::KeyRange;
 use crate::Result;
+use crate::{EtcdError, EtcdKeyValue};
 
 /// Watch implementation mod.
 mod watch_impl;
 
-/// the timeout of waiting etcd response
+/// The timeout of waiting etcd response
 const WATCH_REQUEST_TIMEOUT_SEC: u64 = 2;
 
-/// watch id
+/// Watch Id
 type WatchID = i64;
+
+/// Watch request message for watcher tasks to send to send loop
+type WatchRequestMsg = (EtcdWatchRequest, Sender<SingleWatchEventReceiver>);
+
+/// new watch request channel
+fn new_watch_request_chan() -> (Sender<WatchRequestMsg>, Receiver<WatchRequestMsg>) {
+    unbounded::<WatchRequestMsg>()
+}
+
+/// Cancel request message for watcher tasks to send to send loop
+type CancelRequestMsg = WatchID;
+
+/// new cancel request channel
+fn new_cancel_request_chan() -> (Sender<CancelRequestMsg>, Receiver<CancelRequestMsg>) {
+    unbounded::<CancelRequestMsg>()
+}
+
+/// Used for the send loop to receive the signal of a completed watch request from receive loop
+///  and handle the left watch request
+type WaitingWatchResponseMsg = ();
+
+/// new waiting watch response channel
+fn new_waiting_watch_response_chan() -> (
+    Sender<WaitingWatchResponseMsg>,
+    Receiver<WaitingWatchResponseMsg>,
+) {
+    bounded::<WaitingWatchResponseMsg>(1)
+}
+
+/// Shutdown message for send loop and receive loop async tasks to exit
+type ShutdownMsg = ();
+
+/// new shutdown channel
+fn new_shutdown_chan() -> (Sender<ShutdownMsg>, Receiver<ShutdownMsg>) {
+    unbounded::<ShutdownMsg>()
+}
 
 /// the recorded watch info in a lock
 #[derive(Default)]
@@ -82,7 +118,7 @@ struct WatchedMap {
     watchid_2_detail: HashMap<
         WatchID,
         (
-            BroadcastTx<Option<EtcdWatchResponse>>,
+            BroadcastTx<EtcdWatchResponse>,
             Weak<SingleWatchEventReceiverInner>,
         ),
     >,
@@ -93,7 +129,7 @@ impl WatchedMap {
         &mut self,
         watchid: WatchID,
         keyrange: KeyRange,
-        sender_2_user: BroadcastTx<Option<EtcdWatchResponse>>,
+        sender_2_user: BroadcastTx<EtcdWatchResponse>,
         user_receiver: Weak<SingleWatchEventReceiverInner>,
     ) {
         self.keyrange_2_watchid.insert(keyrange, watchid);
@@ -114,11 +150,11 @@ impl WatchedMap {
         None
     }
 
-    /// get sender 2 user to send watched event
-    fn get_sender_2_user(
+    /// get broadcast sender to watcher who requested with the watch id
+    fn get_broadcast_sender_2_watcher(
         &self,
         watchid: WatchID,
-    ) -> Option<BroadcastTx<Option<EtcdWatchResponse>>> {
+    ) -> Option<BroadcastTx<EtcdWatchResponse>> {
         if let Some(&(ref sender, _)) = self.watchid_2_detail.get(&watchid) {
             return Some(sender.clone());
         }
@@ -136,7 +172,7 @@ impl WatchedMap {
                     None => {
                         // `remove_watch` in `WatchedMap` should be called when receiver is dropped
                         panic!(
-                            "Receivers were all dropped but the registed info has not been removed, which is impossible"
+                            "Receivers were all dropped but the registered info has not been removed, which is impossible"
                         );
                     }
                 }
@@ -149,20 +185,21 @@ impl WatchedMap {
 
 /// Watch related data shared between watch communication task and user receivers
 struct WatchTunnelShared {
-    /// A map shared to get the sender to registed watches for a keyrange
+    /// A map shared to get the sender to registered watches for a keyrange
     watched_map: Lazy<WatchedMap>,
     /// Queued watch requests
-    queued_watch_requests: SegQueue<(EtcdWatchRequest, Sender<Option<SingleWatchEventReceiver>>)>,
+    queued_watch_requests: SegQueue<(EtcdWatchRequest, Sender<SingleWatchEventReceiver>)>,
     /// Watch request waiting for response
-    waiting_watch_request: Lazy<Option<(KeyRange, Sender<Option<SingleWatchEventReceiver>>)>>,
+    waiting_watch_request: Lazy<Option<(KeyRange, Sender<SingleWatchEventReceiver>)>>,
 
-    /// A channel sender to send cancel request to etcd
-    ///  cancel request: KeyRange to find the watch id and
+    /// A channel sender for watchers to send cancel request to send loop,
+    ///  then the send loop will send cancel request to etcd
     cancel_req_sender: Sender<WatchID>,
-    /// Waiting cancel requests, bool refers to whether the response arrived in time
+    /// Record the waiting cancel requests, when a cancel response arrived,
+    ///  it will get the sender from this map and send a signal to the canceling task.
     waiting_cancels: Lazy<HashMap<WatchID, Sender<()>>>,
 
-    /// A channel sender to send shutdowm request.
+    /// A channel sender to send shutdown request.
     shutdown: Sender<()>,
 
     /// Sub tasks
@@ -209,18 +246,18 @@ impl WatchTunnelShared {
                     .push(
                         smol::spawn(async move {
                             futures::select! {
-                        _ = smol::Timer::after(Duration::from_secs(WATCH_REQUEST_TIMEOUT_SEC)).into_future().fuse()=>{
-                            // todo: add retry for failed request
-                            // return Err(EtcdError::WaitingResponseTimeout("waiting for cancel response when calling `cancel_watch`".to_owned()));
-                            log::debug!("cancel watch wait response timeout");
-                        }
-                        res = rx.recv().into_future().fuse()=>{
-                            res.unwrap_or_else(|e|{
-                                panic!("receive cancel response channel shouldn't be destroyed, err:{e}");
-                            });
-                            log::debug!("cancel watch successed");
-                        }
-                    }
+                                _ = smol::Timer::after(Duration::from_secs(WATCH_REQUEST_TIMEOUT_SEC)).into_future().fuse()=>{
+                                    // todo: add retry for failed request
+                                    // return Err(EtcdError::WaitingResponseTimeout("waiting for cancel response when calling `cancel_watch`".to_owned()));
+                                    log::debug!("cancel watch wait response timeout");
+                                }
+                                res = rx.recv().into_future().fuse()=>{
+                                    res.unwrap_or_else(|e|{
+                                        panic!("receive cancel response channel shouldn't be destroyed, err:{e}");
+                                    });
+                                    log::debug!("cancel watch successed");
+                                }
+                            }
                         })
                     );
             }
@@ -234,7 +271,7 @@ impl WatchTunnelShared {
 #[allow(dead_code)]
 struct WatchTunnel {
     /// A channel sender to send watch request to send loop.
-    watch_req_sender: Sender<(EtcdWatchRequest, Sender<Option<SingleWatchEventReceiver>>)>,
+    watch_req_sender: Sender<(EtcdWatchRequest, Sender<SingleWatchEventReceiver>)>,
     /// A channel receiver to receive watch response.
     // resp_receiver: Option<Receiver<Result<EtcdWatchResponse>>>,
 
@@ -243,83 +280,79 @@ struct WatchTunnel {
 }
 
 impl WatchTunnel {
-    #[allow(clippy::too_many_lines)]
-    /// Creates a new `WatchClient`.
-    fn new(client: &WatchClient) -> Self {
-        let (watch_req_sender, watch_req_receiver) =
-            unbounded::<(EtcdWatchRequest, Sender<Option<SingleWatchEventReceiver>>)>();
-        // todo: cancel operation
-        let (cancel_req_sender, cancel_req_receiver) = unbounded::<WatchID>();
-        // From recv loop to send loop, notify a watch request is done, next watch can be excuted.
-        let (waiting_watch_response_tx, waiting_watch_response_rx) = bounded::<()>(1);
-        let (shutdown_tx, shutdown_rx) = unbounded::<()>();
-        let shutdown_reponse = shutdown_rx.clone();
-        // Monitor inbound watch response and transfer to the receiver
-        let (mut client_req_sender, mut client_resp_receiver) = client
-            .watch()
-            .unwrap_or_else(|e| panic!("failed to send watch command, the error is: {}", e));
+    /// send watch request or add to queue or get receiver directly
+    ///  return true if a request is sent
+    #[inline]
+    async fn handle_watch_request(
+        client_req_sender: &mut StreamingCallSink<WatchRequest>,
+        shared: &WatchTunnelShared,
+        req: EtcdWatchRequest,
+        send_back: Sender<SingleWatchEventReceiver>,
+    ) -> bool {
+        let keyrange = KeyRange::range(req.get_key(), req.get_range_end());
+        // The locking operation on the map here is mutually exclusive with the map operation of cancel_watch.
+        //  Therefore, the sender to the user will definitely be valid during the map holding period.
+        let watched_map = shared.watched_map.read().await;
 
-        let shared = Arc::new(WatchTunnelShared::new(cancel_req_sender, shutdown_tx));
-        let shared2 = Arc::clone(&shared);
-        let shared3 = Arc::clone(&shared);
+        // The key range of request is already watched
+        if let Some(event_receiver) = watched_map.get_arc_receiver(&keyrange) {
+            log::debug!("{} watched directly return", keyrange);
+            // already watched
+            if let Err(err) = send_back.send(event_receiver).await {
+                panic!("Send watch receiver to user failed, Watch canceled, err: {err}");
+            }
+        }
+        // There's a watch request waiting for response
+        else if shared.waiting_watch_request.read().await.is_some() {
+            drop(watched_map);
+            log::debug!("watch queued");
+            shared.queued_watch_requests.push((req, send_back));
+        }
+        // This request can be send directly
+        else {
+            drop(watched_map);
+            log::debug!("{} isn't watched, send new watch request", keyrange);
+            // new watch request
+            *shared.waiting_watch_request.write().await = Some((keyrange, send_back));
 
+            client_req_sender
+                .send((req.into(), WriteFlags::default()))
+                .fuse()
+                .await
+                .unwrap_or_else(|e| panic!("Fail to send request, the error is {}", e));
+            // waiting_watch_response=true;
+            return true;
+        }
+        false
+    }
+
+    #[inline]
+    /// The loop to receive msg from watcher tasks and send watch request to etcd
+    fn spawn_send_loop(
+        shutdown_rx: Receiver<ShutdownMsg>,
+        shared: Arc<WatchTunnelShared>,
+        waiting_watch_response_rx: Receiver<WaitingWatchResponseMsg>,
+        watch_req_receiver: Receiver<WatchRequestMsg>,
+        cancel_req_receiver: Receiver<CancelRequestMsg>,
+        mut client_req_sender: StreamingCallSink<WatchRequest>,
+    ) {
         // Send loop
         smol::spawn(async move {
             let mut shutdown_rx = shutdown_rx.into_future().fuse();
 
             #[allow(clippy::mut_mut)]
             loop {
-                /// send watch request or add to queue or get receiver directly
-                ///  return true if a request is sent
-                async fn handle_watch_request(
-                    client_req_sender: &mut StreamingCallSink<WatchRequest>,
-                    shared: &WatchTunnelShared,
-                    req: EtcdWatchRequest,
-                    send_back: Sender<Option<SingleWatchEventReceiver>>
-                ) -> bool {
-                    let keyrange = KeyRange::range(req.get_key(), req.get_range_end());
-                    // The locking operation on the map here is mutually exclusive with the map operation of cancel_watch.
-                    //  Therefore, the sender to the user will definitely be valid during the map holding period.
-                    let watched_map = shared.watched_map.read().await;
-                    if let Some(event_receiver) = watched_map.get_arc_receiver(&keyrange) {
-                        log::debug!("{} watched directly return", keyrange);
-                        // already watched
-                        if let Err(err) = send_back.send(Some(event_receiver)).await {
-                            panic!(
-                                "Send watch receiver to user failed, Watch canceled, err: {err}"
-                            );
-                        }
-                    } else if shared.waiting_watch_request.read().await.is_some() {
-                        log::debug!("watch queued");
-                        shared.queued_watch_requests.push((req, send_back));
-                    } else {
-                        drop(watched_map);
-                        log::debug!("{} isn't watched, send new watch request", keyrange);
-                        // new watch request
-                        *shared.waiting_watch_request.write().await = Some((keyrange, send_back));
-
-                        client_req_sender
-                            .send((req.into(), WriteFlags::default()))
-                            .fuse().await
-                            .unwrap_or_else(|e| panic!("Fail to send request, the error is {}", e));
-                        // waiting_watch_response=true;
-                        return true;
-                    }
-                    false
-                }
-
                 futures::select! {
-                    //1. Wait new watch request
+                    //1. Wait for new watch request
                     res = watch_req_receiver.recv().into_future().fuse() => {
                         // received user
                         if let Ok((req,send_back)) = res {
-                            handle_watch_request(&mut client_req_sender,&shared,req,send_back).await;
+                            Self::handle_watch_request(&mut client_req_sender,&shared,req,send_back).await;
                         }else{
                             break;
                         }
                     },
-                    //2. wait new cancel request
-                    // send
+                    //2. wait for new cancel request
                     res = cancel_req_receiver.recv().into_future().fuse() => {
                         if let Ok(watch_id) = res {
                             client_req_sender.send(
@@ -331,14 +364,13 @@ impl WatchTunnel {
                             break;
                         }
                     },
-                    //3. wait watch response
-                    // if has queuened request send
+                    //3. wait for watch response, after an response arrived, this channel will receive a msg
                     _ = waiting_watch_response_rx.recv().into_future().fuse() =>{
                         // receive when a watch request got its response
                         // waiting_watch_response=false;
                         while let Some((req,send_back))= shared.queued_watch_requests.pop(){
                             log::debug!("handle queued watch request");
-                            if handle_watch_request(&mut client_req_sender,&shared,req,send_back).await{
+                            if Self::handle_watch_request(&mut client_req_sender,&shared,req,send_back).await{
                                 // left request will be handled after current request get it's response
                                 break;
                             }
@@ -348,15 +380,100 @@ impl WatchTunnel {
                 }
             }
         }).detach();
+    }
+
+    /// Handle create response from etcd server
+    #[inline]
+    async fn handle_create_response(
+        resp: WatchResponse,
+        shared: &Arc<WatchTunnelShared>,
+        waiting_watch_response_tx: &Sender<WaitingWatchResponseMsg>,
+    ) {
+        let (keyrange, send_back) = shared
+            .waiting_watch_request
+            .write()
+            .await
+            .take()
+            .unwrap_or_else(|| panic!("watch create response must have a waiting create request"));
+
+        let (tx, rx) = async_broadcast::broadcast::<EtcdWatchResponse>(10);
+        // let (tx,rx)=unbounded::<Option<EtcdWatchResponse>>();
+        let receiver_for_user =
+            SingleWatchEventReceiver::new(Arc::clone(shared), rx, keyrange.clone());
+        shared.watched_map.write().await.add_watched(
+            resp.watch_id,
+            keyrange.clone(),
+            tx,
+            receiver_for_user.get_weak_inner(),
+        );
+        // send watch result back to user
+        if let Err(e) = send_back.send(receiver_for_user).await {
+            panic!("user receiver shouldn't be dropped before watch response arrive, err:{e}");
+        }
+        // notify the send loop to handle next watch requests
+        waiting_watch_response_tx
+            .send(())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("Failed to send watch resp from recv loop to send loop, err:{e}")
+            });
+        log::debug!(
+            "watch created response received and registered id:{} keyrange:{}",
+            resp.watch_id,
+            keyrange
+        );
+    }
+
+    /// Handle cancel response from etcd server
+    async fn handle_cancel_response(resp: WatchResponse, shared: &Arc<WatchTunnelShared>) {
+        let sendback = shared
+            .waiting_cancels
+            .write()
+            .await
+            .remove(&resp.watch_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "watch id must be recorded in `waiting_cancels` before receive cancel respinse"
+                )
+            });
+        sendback
+            .send(())
+            .await
+            .unwrap_or_else(|e| panic!("send back channel shouldn't be destroyed, err:{e}"));
+    }
+
+    /// Handle event response from etcd server
+    async fn handle_event_response(resp: WatchResponse, shared: &Arc<WatchTunnelShared>) {
+        // The locking operation on the map here is mutually exclusive with the map operation of cancel_watch.
+        //  Therefore, the sender to the user will definitely be valid during the map holding period.
+        let watched_map = shared.watched_map.read().await;
+        let sendback = watched_map.get_broadcast_sender_2_watcher(resp.watch_id);
+        if let Some(sender) = sendback {
+            log::debug!("watch event received and sent");
+            sender.broadcast(resp.into()).await.unwrap_or_else(|e| {
+                panic!("User receiver shouldn't be dropped and send back should work, err:{e}");
+            });
+        } else {
+            log::debug!("received watch event but no user to send to");
+        }
+    }
+
+    #[inline]
+    /// The loop to handle response from server and dispatch to watchers
+    fn spawn_receive_loop(
+        shared: Arc<WatchTunnelShared>,
+        waiting_watch_response_tx: Sender<WaitingWatchResponseMsg>,
+        shutdown_response: Receiver<ShutdownMsg>,
+        mut client_resp_receiver: ClientDuplexReceiver<WatchResponse>,
+    ) {
         // Receive loop
         smol::spawn(async move {
-            let mut shutdown_rx = shutdown_reponse.into_future().fuse();
+            let mut shutdown_rx = shutdown_response.into_future().fuse();
             loop {
                 #[allow(clippy::mut_mut)]
-                let resp =
-                    futures::select! {
+                let resp = futures::select! {
                     resp_opt = client_resp_receiver.next().fuse() => resp_opt.unwrap_or_else(
-                        || panic!("Fail to receive reponse from client")
+                        || panic!("Fail to receive response from client")
                     ),
                     _ = shutdown_rx => { return; }
                 };
@@ -365,79 +482,12 @@ impl WatchTunnel {
                     Ok(resp) => {
                         // watch create response
                         if resp.created {
-                            let (keyrange, send_back) = shared2.waiting_watch_request
-                                .write().await
-                                .take()
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "watch create response must have a waiting create request"
-                                    )
-                                });
-
-                            let (tx, rx) =
-                                async_broadcast::broadcast::<Option<EtcdWatchResponse>>(10);
-                            // let (tx,rx)=unbounded::<Option<EtcdWatchResponse>>();
-                            let receiver_for_user = SingleWatchEventReceiver::new(
-                                Arc::clone(&shared2),
-                                rx,
-                                keyrange.clone()
-                            );
-                            shared2.watched_map
-                                .write().await
-                                .add_watched(
-                                    resp.watch_id,
-                                    keyrange.clone(),
-                                    tx,
-                                    receiver_for_user.get_weak_inner()
-                                );
-                            // send watch result back to user
-                            if let Err(e) = send_back.send(Some(receiver_for_user)).await {
-                                panic!(
-                                    "user receiver shouldn't be dropped before watch response arrive, err:{e}"
-                                );
-                            }
-                            // notify the send loop to handle next watch requests
-                            waiting_watch_response_tx
-                                .send(()).await
-                                .unwrap_or_else(|e| {
-                                    panic!(
-                                        "Failed to send watch resp from recv loop to send loop, err:{e}"
-                                    )
-                                });
-                            log::debug!(
-                                "watch created response received and registed id:{} keyrange:{}",
-                                resp.watch_id,
-                                keyrange
-                            );
+                            Self::handle_create_response(resp, &shared, &waiting_watch_response_tx)
+                                .await;
                         } else if resp.canceled {
-                            let sendback = shared2.waiting_cancels
-                                .write().await
-                                .remove(&resp.watch_id)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "watch id must be recorded in `waiting_cancels` before receive cancel respinse"
-                                    )
-                                });
-                            sendback
-                                .send(()).await
-                                .unwrap_or_else(|e| {
-                                    panic!("send back channel shouldn't be destroyed, err:{e}")
-                                });
+                            Self::handle_cancel_response(resp, &shared).await;
                         } else {
-                            // The locking operation on the map here is mutually exclusive with the map operation of cancel_watch.
-                            //  Therefore, the sender to the user will definitely be valid during the map holding period.
-                            let watched_map = shared2.watched_map.read().await;
-                            let sendback = watched_map.get_sender_2_user(resp.watch_id);
-                            if let Some(sender) = sendback {
-                                log::debug!("watch event received and sent");
-                                sender.broadcast(Some(resp.into())).await.unwrap_or_else(|e| {
-                                    panic!(
-                                        "User receiver shouldn't be dropped and send back should work, err:{e}"
-                                    );
-                                });
-                            } else {
-                                log::debug!("received watch event but no user to send to");
-                            }
+                            Self::handle_event_response(resp, &shared).await;
                         }
                     }
                     Err(e) => {
@@ -446,11 +496,43 @@ impl WatchTunnel {
                     }
                 }
             }
-        }).detach();
+        })
+        .detach();
+    }
+
+    /// Creates a new `WatchClient`.
+    fn new(client: &WatchClient) -> Self {
+        let (watch_req_sender, watch_req_receiver) = new_watch_request_chan();
+        let (cancel_req_sender, cancel_req_receiver) = new_cancel_request_chan();
+        // From recv loop to send loop, notify a watch request is done, next watch can be excuted.
+        let (waiting_watch_response_tx, waiting_watch_response_rx) =
+            new_waiting_watch_response_chan();
+        let (shutdown_tx, shutdown_rx) = new_shutdown_chan();
+        let shutdown_response = shutdown_rx.clone();
+        // Monitor inbound watch response and transfer to the receiver
+        let (client_req_sender, client_resp_receiver) = client
+            .watch()
+            .unwrap_or_else(|e| panic!("failed to send watch command, the error is: {}", e));
+
+        let shared = Arc::new(WatchTunnelShared::new(cancel_req_sender, shutdown_tx));
+        Self::spawn_receive_loop(
+            Arc::clone(&shared),
+            waiting_watch_response_tx,
+            shutdown_response,
+            client_resp_receiver,
+        );
+        Self::spawn_send_loop(
+            shutdown_rx,
+            Arc::clone(&shared),
+            waiting_watch_response_rx,
+            watch_req_receiver,
+            cancel_req_receiver,
+            client_req_sender,
+        );
 
         Self {
             watch_req_sender,
-            shared: shared3,
+            shared,
         }
     }
 
@@ -464,7 +546,7 @@ impl WatchTunnel {
 /// shared inner of `SingleWatchEventReceiver`
 struct SingleWatchEventReceiverInner {
     /// A receiver to receive etcd watched event
-    receiver: InactiveReceiver<Option<EtcdWatchResponse>>,
+    receiver: InactiveReceiver<EtcdWatchResponse>,
     /// A tunnel used to communicate with Etcd server for watch operations.
     shared: Arc<WatchTunnelShared>,
     /// Watched keyrange
@@ -491,7 +573,7 @@ pub struct SingleWatchEventReceiver {
     inner: Arc<SingleWatchEventReceiverInner>,
 
     /// A receiver to receive etcd watched event
-    receiver: BroadcastRx<Option<EtcdWatchResponse>>,
+    receiver: BroadcastRx<EtcdWatchResponse>,
 }
 
 impl SingleWatchEventReceiver {
@@ -514,7 +596,7 @@ impl SingleWatchEventReceiver {
     /// - `keyrange` Watched keyrange
     fn new(
         shared: Arc<WatchTunnelShared>,
-        receiver: BroadcastRx<Option<EtcdWatchResponse>>,
+        receiver: BroadcastRx<EtcdWatchResponse>,
         keyrange: KeyRange,
     ) -> Self {
         let inner_receiver = receiver.clone().deactivate();
@@ -529,12 +611,14 @@ impl SingleWatchEventReceiver {
     }
 
     /// Blocking recv a watch event until system end.
-    pub async fn recv(&mut self) -> Option<EtcdWatchResponse> {
+    pub async fn recv(&mut self) -> Result<EtcdWatchResponse> {
         match self.receiver.recv().await {
-            Ok(received) => received,
+            Ok(received) => Ok(received),
             Err(err) => {
                 log::debug!("Receive event channel destroyed, the system is closing. err: {err}");
-                None
+                Err(EtcdError::ClientClosed(
+                    "The system is closing when call SingleWatchEventReceiver's recv.".to_owned(),
+                ))
             }
         }
     }
@@ -558,11 +642,15 @@ impl Watch {
     /// Performs a watch operation.
     /// Will fail if
     ///
+    /// # Errors
+    ///
+    /// etcd error: client closed
+    ///
     /// # Panics
     ///
-    /// Will panic if send watch request error.
+    /// panic if recv watch response failed
     #[inline]
-    pub async fn watch(&mut self, key_range: KeyRange) -> Option<SingleWatchEventReceiver> {
+    pub async fn watch(&mut self, key_range: KeyRange) -> Result<SingleWatchEventReceiver> {
         let (tx, rx) = unbounded();
         if let Err(err) = self
             .tunnel
@@ -573,12 +661,13 @@ impl Watch {
             log::debug!(
                 "send watch watch request failed, the channel is destroyed and the system is closed, err:{err}"
             );
-            return None;
+            return Err(EtcdError::ClientClosed("send watch watch request failed, the channel is destroyed and the system is closed".to_owned()));
         }
 
-        rx.recv()
+        Ok(rx
+            .recv()
             .await
-            .unwrap_or_else(|e| panic!("watch resp channel shouldn't be ineffective, err:{}", e))
+            .unwrap_or_else(|e| panic!("watch resp channel shouldn't be ineffective, err:{}", e)))
     }
 
     /// Shut down the running watch task, if any.
