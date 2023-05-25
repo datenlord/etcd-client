@@ -40,9 +40,9 @@ impl EtcdWatchRequest {
     /// Creates a new `WatchRequest` which will unsubscribe the specified watch.
     #[inline]
     #[must_use]
-    pub fn cancel(watch_id: usize) -> Self {
+    pub fn cancel(watch_id: i64) -> Self {
         let mut watch_cancel_request = WatchCancelRequest::new();
-        watch_cancel_request.set_watch_id(watch_id.cast());
+        watch_cancel_request.set_watch_id(watch_id);
         let mut watch_request = WatchRequest::new();
         watch_request.set_cancel_request(watch_cancel_request);
         Self {
@@ -97,7 +97,17 @@ impl EtcdWatchRequest {
         }
         vec![]
     }
-
+    /// Gets the watch key range end.
+    /// It only effects when the request is for subscribing.
+    #[inline]
+    pub fn get_range_end(&self) -> Vec<u8> {
+        if let &Some(WatchRequest_oneof_request_union::create_request(ref req)) =
+            &self.proto.request_union
+        {
+            return req.get_range_end().to_vec();
+        }
+        vec![]
+    }
     /// Returns if the watch request is a create watch request.
     #[inline]
     pub fn is_create(&self) -> bool {
@@ -115,7 +125,7 @@ impl From<EtcdWatchRequest> for WatchRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Watch Response
 pub struct EtcdWatchResponse {
     /// Etcd watch key response.

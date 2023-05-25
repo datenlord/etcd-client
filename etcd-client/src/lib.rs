@@ -11,32 +11,32 @@
 //!
 //! fn main() -> Result<()> {
 //!     smol::block_on(async {
-//!     let config = ClientConfig::new(vec!["http://127.0.0.1:2379".to_owned()], None, 32, true);
-//!     let client = Client::connect(config).await?;
-//!
-//!     let key = "foo";
-//!     let value = "bar";
-//!
-//!     // Put a key-value pair
-//!     let resp = client.kv().put(EtcdPutRequest::new(key, value)).await?;
-//!
-//!     println!("Put Response: {:?}", resp);
-//!
-//!     // Get the key-value pair
-//!     let resp = client
-//!         .kv()
-//!         .range(EtcdRangeRequest::new(KeyRange::key(key)))
-//!         .await?;
-//!     println!("Range Response: {:?}", resp);
-//!
-//!     // Delete the key-valeu pair
-//!     let resp = client
-//!         .kv()
-//!         .delete(EtcdDeleteRequest::new(KeyRange::key(key)))
-//!         .await?;
-//!     println!("Delete Response: {:?}", resp);
-//!
-//!     Ok(())
+//!         let config =
+//!             ClientConfig::new(vec!["http://127.0.0.1:2379".to_owned()], None, 32, true);
+//!         let client = Client::connect(config).await?;
+//!     
+//!         // print out all received watch responses
+//!         let mut inbound = client.watch(KeyRange::key("foo")).await.unwrap();
+//!         smol::spawn(async move {
+//!             while let Ok(resp) = inbound.recv().await {
+//!                 println!("watch response: {:?}", resp);
+//!             }
+//!         })
+//!         .detach();
+//!         
+//!         let key = "foo";
+//!         client.kv().put(EtcdPutRequest::new(key, "bar")).await?;
+//!         client.kv().put(EtcdPutRequest::new(key, "baz")).await?;
+//!         client
+//!             .kv()
+//!             .delete(EtcdDeleteRequest::new(KeyRange::key(key)))
+//!             .await?;
+//!         
+//!         // not necessary, but will cleanly shut down the long-running tasks
+//!         // spawned by the client
+//!         client.shutdown().await.unwrap();
+//!         
+//!         Ok(())
 //!     })
 //! }
 //! ```
@@ -203,13 +203,19 @@ async fn sleep(d: Duration) {
     smol::Timer::after(d).await;
 }
 
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    dead_code
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_compat::Compat;
     use clippy_utilities::Cast;
-    use futures::StreamExt;
     use std::collections::HashMap;
+    use std::env::set_var;
     use std::time::Duration;
     use std::time::SystemTime;
 
@@ -218,68 +224,164 @@ mod tests {
     //const DEFAULT_ETCD_ENDPOINT2_FOR_TEST: &str = "127.0.0.1:2380";
 
     #[test]
+    /// Here we used a blocking and sequential structure to run the tests
+    ///  because using separate test functions would result in parallel
+    ///  execution of different tests when we run the global test.
+    /// However, some etcd operations conflict with each other,
+    ///  such as deleting all keys.
+    /// Even when using prefixes to differentiate the scope of
+    ///  different test operations, the operation that deletes all keys still
+    ///  has a global impact and would read the results of other tests.
     fn test_all() -> Result<()> {
-        env_logger::init();
+        set_var("RUST_LOG", "debug");
+
+        env_logger::try_init().unwrap_or_else(|e| {
+            log::debug!("env_logger try init failed, err:{}", e);
+        });
+
         smol::block_on(Compat::new(async {
             test_kv().await?;
             test_transaction().await?;
+            test_watch("test_all").await?;
             test_lock().await?;
-            test_watch().await?;
+
             Ok(())
         }))
     }
 
-    async fn test_watch() -> Result<()> {
-        let client = build_etcd_client().await?;
-
-        client
-            .kv()
-            .put(EtcdPutRequest::new("41_foo1", "baz1"))
-            .await?;
-        client
-            .kv()
-            .put(EtcdPutRequest::new("42_foo1", "baz2"))
-            .await?;
-
-        let watch_key = "41_foo1";
-        let mut response = client.watch(KeyRange::key(watch_key)).await;
-        assert_eq!(
-            response
-                .next()
+    async fn test_watch(key_prefix: &str) -> Result<()> {
+        /// For one task to watch put and deletion of a key to check is it support multi watchers
+        async fn watch_one(watch_key: &str, client: Client) {
+            let mut watch = client
+                .watch(KeyRange::key(watch_key))
                 .await
-                .unwrap_or_else(|| panic!("Fail to receive reponse from client"))
-                .unwrap_or_else(|e| { panic!("failed to get watch response, the error is: {}", e) })
-                .watch_id(),
-            0,
-            "Receive wrong watch response from etcd server"
-        );
+                .unwrap_or_else(|e| panic!("watch failed, err:{}", e));
+
+            {
+                let mut resp = watch
+                    .recv()
+                    .await
+                    .unwrap_or_else(|e| panic!("failed to get watch, err:{}", e));
+                let mut resp_events = resp.take_events();
+                assert_eq!(resp_events.len(), 1, "There should be one event");
+                assert_eq!(
+                    resp_events[0].event_type(),
+                    EventType::Put,
+                    "The event should be put"
+                );
+                let kvs = resp_events[0]
+                    .take_kvs()
+                    .unwrap_or_else(|| panic!("There should be kv"));
+                assert_eq!(kvs.key_str(), watch_key, "The key should be watched key");
+                assert_eq!(kvs.value_str(), "baz3", "The value should be baz3");
+            }
+            {
+                let mut resp = watch
+                    .recv()
+                    .await
+                    .unwrap_or_else(|e| panic!("Failed to get watch, err:{}", e));
+                let mut resp_events = resp.take_events();
+                assert_eq!(resp_events.len(), 1, "There should be one event");
+                assert_eq!(
+                    resp_events[0].event_type(),
+                    EventType::Delete,
+                    "The event should be delete"
+                );
+                let kvs = &mut resp_events[0]
+                    .take_kvs()
+                    .unwrap_or_else(|| panic!("should have kv"));
+                assert_eq!(kvs.key_str(), watch_key, "The key should be watched key");
+            }
+        }
+
+        let client = build_etcd_client().await?;
+        let key1 = format!("{}41_foo1", key_prefix);
+        let key2 = format!("{}42_foo1", key_prefix);
 
         client
             .kv()
-            .put(EtcdPutRequest::new("41_foo1", "baz3"))
+            .put(EtcdPutRequest::new(key1.as_str(), "baz1"))
             .await?;
-        let mut watch_response = response
-            .next()
-            .await
-            .unwrap_or_else(|| panic!("Fail to receive reponse from client"))
-            .unwrap_or_else(|e| panic!("failed to get watch response, the error is: {}", e));
+        client
+            .kv()
+            .put(EtcdPutRequest::new(key2.as_str(), "baz2"))
+            .await?;
 
-        assert_eq!(
-            watch_response.watch_id(),
-            0,
-            "Receive wrong watch response from etcd server"
-        );
-        assert_eq!(
-            watch_response.take_events().len(),
-            1,
-            "Receive wrong watch events from etcd server"
-        );
+        // Spawn an async task to do put operation and delete operation,
+        //  which should be watched by the watch task.
+        {
+            let client = client.clone();
+            let key1 = key1.clone();
+            let key2 = key2.clone();
+            smol::spawn(async move {
+                smol::Timer::after(Duration::from_secs(1)).await;
+                client
+                    .kv()
+                    .put(EtcdPutRequest::new(key1.as_str(), "baz3"))
+                    .await
+                    .unwrap();
+                client
+                    .kv()
+                    .put(EtcdPutRequest::new(key2.as_str(), "baz3"))
+                    .await
+                    .unwrap();
+                smol::Timer::after(Duration::from_secs(1)).await;
+                client
+                    .kv()
+                    .delete(EtcdDeleteRequest::new(KeyRange::key(key1.as_str())))
+                    .await
+                    .unwrap();
+                client
+                    .kv()
+                    .delete(EtcdDeleteRequest::new(KeyRange::key(key2.as_str())))
+                    .await
+                    .unwrap();
+            })
+            .detach();
+        }
+
+        // Spawn 4 async tasks to watch the put and delete operation of the key.
+        // Every 2 tasks watch the same key.
+        let joiners = vec![
+            {
+                let client = client.clone();
+                let watchkey = key1.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+            {
+                let client = client.clone();
+                let watchkey = key1.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+            {
+                let client = client.clone();
+                let watchkey = key2.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+            {
+                let client = client.clone();
+                let watchkey = key2.clone();
+                smol::spawn(async move {
+                    watch_one(watchkey.as_str(), client).await;
+                })
+            },
+        ];
+        futures::future::join_all(joiners).await;
         clean_etcd(&client).await?;
         client.shutdown().await?;
+
         Ok(())
     }
 
     async fn test_lock() -> Result<()> {
+        log::debug!("test_lock");
+
         // 1. Lock on "ABC"
         let client = build_etcd_client().await?;
         let lease_id = client
@@ -340,6 +442,7 @@ mod tests {
     }
 
     async fn test_transaction() -> Result<()> {
+        log::debug!("test_transaction");
         let client = build_etcd_client().await?;
         test_compose(&client).await?;
         clean_etcd(&client).await?;
@@ -405,6 +508,7 @@ mod tests {
     }
 
     async fn test_kv() -> Result<()> {
+        log::debug!("test_kv");
         let client = build_etcd_client().await?;
         test_list_prefix(&client).await?;
         test_range_query(&client).await?;

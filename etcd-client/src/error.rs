@@ -24,4 +24,10 @@ pub enum EtcdError {
     /// Internal Error
     #[error("Internal Error: {0}")]
     InternalError(String),
+    /// waiting for response timeout
+    #[error("waiting for response timeout: {0}")]
+    WaitingResponseTimeout(String),
+    /// Client closed
+    #[error("etcd client closed: {0}")]
+    ClientClosed(String),
 }

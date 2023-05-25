@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
-use smol::stream::Stream;
 use std::net::SocketAddr;
 
 use grpcio::{Channel, ChannelBuilder, EnvBuilder, LbPolicy};
 
-use crate::protos::{
-    lock_grpc::LockClient,
-    rpc_grpc::{AuthClient, KvClient, LeaseClient, WatchClient},
+use crate::{
+    protos::{
+        lock_grpc::LockClient,
+        rpc_grpc::{AuthClient, KvClient, LeaseClient, WatchClient},
+    },
+    watch::SingleWatchEventReceiver,
 };
-use crate::watch::EtcdWatchResponse;
 use crate::{Auth, KeyRange, Kv, Lease, Lock, Result, Watch};
 
 /// Config for establishing etcd client.
@@ -150,13 +151,13 @@ impl Client {
             inner: Arc::new(Inner {
                 channel: channel.clone(),
                 auth_client: Auth::new(AuthClient::new(channel.clone())),
+                watch_client: Watch::new(&etcd_watch_client),
                 kv_client: Kv::new(
                     KvClient::new(channel.clone()),
-                    etcd_watch_client.clone(),
+                    etcd_watch_client,
                     cfg.cache_size,
                     cfg.cache_enable,
                 ),
-                watch_client: Watch::new(etcd_watch_client),
                 lease_client: Lease::new(LeaseClient::new(channel.clone())),
                 lock_client: Lock::new(LockClient::new(channel)),
             }),
@@ -192,11 +193,12 @@ impl Client {
     }
 
     /// Perform a watch operation
+    ///
+    ///  # Errors
+    ///
+    /// etcd error: client closed
     #[inline]
-    pub async fn watch(
-        &self,
-        key_range: KeyRange,
-    ) -> impl Stream<Item = Result<EtcdWatchResponse>> {
+    pub async fn watch(&self, key_range: KeyRange) -> Result<SingleWatchEventReceiver> {
         let mut client = self.inner.watch_client.clone();
         client.watch(key_range).await
     }
