@@ -378,7 +378,7 @@ impl MockEtcdInner {
         let prev_revision = self.revision.fetch_add(1, Ordering::Relaxed);
         kv.set_mod_revision(prev_revision.overflow_add(1));
         let prev_kv = self.map.get(&req.get_key().to_vec()).cloned();
-        if let Some(ref prev_kv) = prev_kv {
+        if let Some(prev_kv) = &prev_kv {
             kv.set_version(prev_kv.get_version().overflow_add(1));
         } else {
             kv.set_version(1);
