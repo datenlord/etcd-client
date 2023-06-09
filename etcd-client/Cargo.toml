@@ -22,7 +22,7 @@ bytes = "0.5"
 clippy-utilities = "0.1.0"
 either = "1.6.1"
 futures = "0.3.5"
-grpcio = { version = "0.9.1", default-features = false, features = ["protobuf-codec"] }
+grpcio = { version = "0.10.4", default-features = false, features = ["protobuf-codec"] }
 http = "0.2"
 log = "0.4.11"
 lockfree-cuckoohash = { git = "https://github.com/datenlord/lockfree-cuckoohash", rev = "27f965b"}
