@@ -25,6 +25,7 @@ use log::{debug, error, warn};
 use protobuf::RepeatedField;
 use smol::lock::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,13 +113,13 @@ struct KeyRange {
 
 /// Mock Etcd
 #[derive(Clone)]
-struct MockEtcd {
+pub(crate) struct MockEtcd {
     /// Inner Data
     inner: Arc<Mutex<MockEtcdInner>>,
 }
 
 /// Mocd Etcd Inner
-struct MockEtcdInner {
+pub(crate) struct MockEtcdInner {
     /// map to store key value
     map: HashMap<Vec<u8>, KeyValue>,
     /// map to store key and watch ids
