@@ -19,7 +19,7 @@ log = "0.4.11"
 protobuf = "2.16.2"
 utilities = { git = "https://github.com/datenlord/utilities", rev = "4ef408d" }
 smol = { version = "1.2.5" }
-
+async-recursion = "1.0.4"
 
 [build-dependencies]
 protoc-grpcio = "3.0.0"
