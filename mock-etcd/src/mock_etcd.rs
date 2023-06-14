@@ -11,14 +11,17 @@ use super::rpc::{
     WatchResponse,
 };
 use super::rpc_grpc::{create_kv, create_lease, create_watch, Kv, Lease, Watch};
+use crate::rpc::{RequestOp, ResponseOp};
 use async_io::Timer;
+use async_lock::MutexGuard;
+use async_recursion::async_recursion;
 use futures::future::TryFutureExt;
 use futures::prelude::*;
 use grpcio::{
     DuplexSink, Environment, RequestStream, RpcContext, RpcStatus, RpcStatusCode, Server,
     ServerBuilder, UnarySink, WriteFlags,
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use protobuf::RepeatedField;
 use smol::lock::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -150,32 +153,38 @@ impl MockEtcdInner {
         }
     }
 
-    /// Get values of keys from a `RangeRequest` to map
-    #[allow(clippy::pattern_type_mismatch)]
-    fn map_get(&self, req: &RangeRequest) -> Vec<KeyValue> {
-        let key = req.get_key().to_vec();
-        let range_end = req.get_range_end().to_vec();
+    /// Get kv by key vec
+    fn map_get(&self, range_begin: &[u8], range_end: &[u8]) -> Vec<KeyValue> {
         let mut kvs = vec![];
-        match range_end.as_slice() {
+        match range_end {
             ONE_KEY => {
-                if let Some(kv) = self.map.get(&key) {
+                if let Some(kv) = self.map.get(range_begin) {
                     kvs.push(kv.clone());
                 }
             }
             ALL_KEYS => {
-                if key == vec![0_u8] {
+                if *range_begin == vec![0_u8] {
                     self.map.values().for_each(|v| kvs.push(v.clone()));
                 }
             }
             _ => {
                 self.map.iter().for_each(|(k, v)| {
-                    if k >= &key && k < &range_end {
+                    if k.as_slice() >= range_begin && k.as_slice() < range_end {
                         kvs.push(v.clone());
                     }
                 });
             }
         }
         kvs
+    }
+
+    /// Get values of keys from a `RangeRequest` to map
+    #[allow(clippy::pattern_type_mismatch)]
+    #[inline]
+    fn map_get_by_request(&self, req: &RangeRequest) -> Vec<KeyValue> {
+        let key = req.get_key();
+        let range_end = req.get_range_end();
+        self.map_get(key, range_end)
     }
 
     /// Send watch response for a specific watch id to etcd client
@@ -298,13 +307,20 @@ impl MockEtcdInner {
     }
 
     /// Insert a key value from a `PutRequest` to map
-    async fn map_insert(&mut self, req: PutRequest) -> Option<KeyValue> {
+    async fn map_insert(&mut self, req: &PutRequest) -> Option<KeyValue> {
         let mut kv = KeyValue::new();
         kv.set_key(req.get_key().to_vec());
         kv.set_value(req.get_value().to_vec());
+
         let prev_revision = self.revision.fetch_add(1, Ordering::Relaxed);
         kv.set_mod_revision(prev_revision.overflow_add(1));
         let prev_kv = self.map.get(&req.get_key().to_vec()).cloned();
+        if let Some(ref prev_kv) = prev_kv {
+            kv.set_version(prev_kv.get_version().overflow_add(1));
+        } else {
+            kv.set_version(1);
+            kv.set_create_revision(kv.mod_revision);
+        }
         let insert_res = self.map.insert(req.get_key().to_vec(), kv.clone());
         self.send_watch_responses(kv.clone(), prev_kv, Event_EventType::PUT)
             .await;
@@ -313,7 +329,7 @@ impl MockEtcdInner {
 
     /// Delete keys from `DeleteRangeRequest` from map
     #[allow(clippy::pattern_type_mismatch)]
-    async fn map_delete(&mut self, req: DeleteRangeRequest) -> Vec<KeyValue> {
+    async fn map_delete(&mut self, req: &DeleteRangeRequest) -> Vec<KeyValue> {
         let key = req.get_key().to_vec();
         let range_end = req.get_range_end().to_vec();
         let mut prev_kvs = vec![];
@@ -354,6 +370,160 @@ impl MockEtcd {
         Self {
             inner: Arc::new(Mutex::new(MockEtcdInner::new())),
         }
+    }
+
+    /// Handle `RangeRequest`
+    fn range_inner(inner: &mut MutexGuard<'_, MockEtcdInner>, req: &RangeRequest) -> RangeResponse {
+        let kvs = inner.map_get_by_request(req);
+        let mut response = RangeResponse::new();
+        response.set_count(kvs.len().cast());
+        response.set_kvs(RepeatedField::from_vec(kvs));
+        let header = response.mut_header();
+        header.set_revision(inner.revision.load(Ordering::Relaxed));
+        response
+    }
+
+    /// Handle `PutRequest`
+    async fn put_inner(inner: &mut MutexGuard<'_, MockEtcdInner>, req: &PutRequest) -> PutResponse {
+        let mut response = PutResponse::new();
+        let prev = inner.map_insert(req).await;
+        if let Some(kv) = prev {
+            response.set_prev_kv(kv);
+        }
+        let header = response.mut_header();
+        header.set_revision(inner.revision.load(Ordering::Relaxed));
+        response
+    }
+
+    /// Handle `DeleteRangeRequest`
+    async fn delete_range_inner(
+        inner: &mut MutexGuard<'_, MockEtcdInner>,
+        req: &DeleteRangeRequest,
+    ) -> DeleteRangeResponse {
+        let mut response = DeleteRangeResponse::new();
+        let get_prev = req.get_prev_kv();
+        let prev_kvs = inner.map_delete(req).await;
+        response.set_deleted(prev_kvs.len().cast());
+        if get_prev {
+            response.set_prev_kvs(RepeatedField::from_vec(prev_kvs));
+        }
+        let header = response.mut_header();
+        header.set_revision(inner.revision.load(Ordering::Relaxed));
+
+        response
+    }
+
+    /// Execute txn operations after compare
+    #[async_recursion]
+    async fn handle_txn_ops(
+        inner_locked: &mut MutexGuard<'_, MockEtcdInner>,
+        reqs: &RepeatedField<RequestOp>,
+    ) -> Vec<ResponseOp> {
+        let mut responses = vec![];
+        for ope in reqs {
+            if ope.has_request_delete_range() {
+                let mut resp = ResponseOp::new();
+                resp.set_response_delete_range(
+                    Self::delete_range_inner(inner_locked, ope.get_request_delete_range()).await,
+                );
+                responses.push(resp);
+            } else if ope.has_request_put() {
+                let mut resp = ResponseOp::new();
+                resp.set_response_put(Self::put_inner(inner_locked, ope.get_request_put()).await);
+                responses.push(resp);
+            } else if ope.has_request_range() {
+                let mut resp = ResponseOp::new();
+                resp.set_response_range(Self::range_inner(inner_locked, ope.get_request_range()));
+                responses.push(resp);
+            } else {
+                assert!(
+                    ope.has_request_txn(),
+                    "txn operation should be one of put, delete_range, range, txn"
+                );
+                let mut resp = ResponseOp::new();
+                resp.set_response_txn(Self::txn_inner(inner_locked, ope.get_request_txn()).await);
+                responses.push(resp);
+            }
+        }
+        responses
+    }
+
+    /// Handle `TxnRequest`
+    async fn txn_inner(inner: &mut MutexGuard<'_, MockEtcdInner>, req: &TxnRequest) -> TxnResponse {
+        let mut response = TxnResponse::new();
+        response.succeeded = true;
+
+        for compare in &req.compare {
+            let begin = compare.get_key();
+            let end = compare.get_range_end();
+            let kvs = inner.map_get(begin, end);
+            // One compare can only match at most one key
+            assert!(kvs.len() < 2);
+            if compare.has_create_revision() {
+                let create_revision = compare.get_create_revision();
+                if create_revision == 0 {
+                    // Expected no key, but key exists
+                    if !kvs.is_empty() {
+                        response.succeeded = false;
+                    }
+                } else {
+                    // Expected key, but key doesn't exist
+                    if let Some(kv) = kvs.get(0) {
+                        response.succeeded = create_revision == kv.get_create_revision();
+                    } else {
+                        response.succeeded = false;
+                    }
+                }
+            } else if compare.has_mod_revision() {
+                let mod_revision = compare.get_mod_revision();
+                if mod_revision == 0 {
+                    // Expected no key, but key exists
+                    if !kvs.is_empty() {
+                        response.succeeded = false;
+                    }
+                } else {
+                    // Expected key, but key doesn't exist
+                    if let Some(kv) = kvs.get(0) {
+                        response.succeeded = mod_revision == kv.get_mod_revision();
+                    } else {
+                        response.succeeded = false;
+                    }
+                }
+            } else if compare.has_value() {
+                if let Some(kv) = kvs.get(0) {
+                    let value = compare.get_value();
+                    response.succeeded = value == kv.get_value();
+                } else {
+                    response.succeeded = false;
+                }
+            } else {
+                assert!(compare.has_version());
+                // if compare.has_version()
+                let version = compare.get_version();
+                if version == 0 {
+                    // Expected no key, but key exists
+                    if !kvs.is_empty() {
+                        response.succeeded = false;
+                    }
+                } else {
+                    // Expected key, but key doesn't exist
+                    if let Some(kv) = kvs.get(0) {
+                        response.succeeded = version == kv.get_version();
+                    } else {
+                        response.succeeded = false;
+                    }
+                }
+            }
+        }
+        if response.succeeded {
+            response.responses =
+                RepeatedField::from_vec(Self::handle_txn_ops(inner, &req.success).await);
+        } else {
+            response.responses =
+                RepeatedField::from_vec(Self::handle_txn_ops(inner, &req.failure).await);
+        }
+
+        response
     }
 }
 
@@ -419,7 +589,7 @@ impl Watch for MockEtcd {
                         }
                     }
                     Err(e) => {
-                        error!("Fail to receive watch request, the error is: {}", e);
+                        warn!("Fail to receive watch request, the error is: {}", e);
                         break;
                     }
                 }
@@ -439,14 +609,9 @@ impl Kv for MockEtcd {
         );
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            let inner = inner_clone.lock().await;
-            let kvs = inner.map_get(&req);
-            let mut response = RangeResponse::new();
-            response.set_count(kvs.len().cast());
-            response.set_kvs(RepeatedField::from_vec(kvs));
-            let header = response.mut_header();
-            header.set_revision(inner.revision.load(Ordering::Relaxed));
-            success(response, sink).await;
+            let mut inner = inner_clone.lock().await;
+
+            success(Self::range_inner(&mut inner, &req), sink).await;
         };
 
         smol::spawn(task).detach();
@@ -462,14 +627,7 @@ impl Kv for MockEtcd {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             let mut inner = inner_clone.lock().await;
-            let mut response = PutResponse::new();
-            let prev = inner.map_insert(req).await;
-            if let Some(kv) = prev {
-                response.set_prev_kv(kv);
-            }
-            let header = response.mut_header();
-            header.set_revision(inner.revision.load(Ordering::Relaxed));
-            success(response, sink).await;
+            success(Self::put_inner(&mut inner, &req).await, sink).await;
         };
         smol::spawn(task).detach();
     }
@@ -489,27 +647,22 @@ impl Kv for MockEtcd {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             let mut inner = inner_clone.lock().await;
-            let mut response = DeleteRangeResponse::new();
-            let get_prev = req.get_prev_kv();
-            let prev_kvs = inner.map_delete(req).await;
-            response.set_deleted(prev_kvs.len().cast());
-            if get_prev {
-                response.set_prev_kvs(RepeatedField::from_vec(prev_kvs));
-            }
-            let header = response.mut_header();
-            header.set_revision(inner.revision.load(Ordering::Relaxed));
+            let response = Self::delete_range_inner(&mut inner, &req).await;
             success(response, sink).await;
         };
         smol::spawn(task).detach();
     }
 
-    fn txn(&mut self, ctx: RpcContext, _req: TxnRequest, sink: UnarySink<TxnResponse>) {
-        fail(
-            &ctx,
-            sink,
-            RpcStatusCode::UNIMPLEMENTED,
-            "Not Implemented".to_owned(),
-        );
+    fn txn(&mut self, _ctx: RpcContext, req: TxnRequest, sink: UnarySink<TxnResponse>) {
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
+        debug!("Receive txn request");
+        smol::spawn(async move {
+            let mut inner = inner_clone.lock().await;
+            let response = Self::txn_inner(&mut inner, &req).await;
+            debug!("Handled txn request");
+            success(response, sink).await;
+        })
+        .detach();
     }
 
     fn compact(
@@ -518,12 +671,9 @@ impl Kv for MockEtcd {
         _req: CompactionRequest,
         sink: UnarySink<CompactionResponse>,
     ) {
-        fail(
-            &ctx,
-            sink,
-            RpcStatusCode::UNIMPLEMENTED,
-            "Not Implemented".to_owned(),
-        );
+        let msg = "Compact Not Implemented";
+        log::debug!("{msg}");
+        fail(&ctx, sink, RpcStatusCode::UNIMPLEMENTED, msg.to_owned());
     }
 }
 
@@ -597,12 +747,9 @@ impl Lease for MockEtcd {
         _req: LeaseRevokeRequest,
         sink: UnarySink<LeaseRevokeResponse>,
     ) {
-        fail(
-            &ctx,
-            sink,
-            RpcStatusCode::UNIMPLEMENTED,
-            "Not Implemented".to_owned(),
-        );
+        let msg = "Lease Revoke Not Implemented";
+        log::debug!("{msg}");
+        fail(&ctx, sink, RpcStatusCode::UNIMPLEMENTED, msg.to_owned());
     }
 
     fn lease_keep_alive(
@@ -611,8 +758,9 @@ impl Lease for MockEtcd {
         _req: RequestStream<LeaseKeepAliveRequest>,
         sink: DuplexSink<LeaseKeepAliveResponse>,
     ) {
-        let rs =
-            RpcStatus::with_message(RpcStatusCode::UNIMPLEMENTED, "Not Implemented".to_owned());
+        let msg = "Lease Keep Alive Not Implemented";
+        log::debug!("{msg}");
+        let rs = RpcStatus::with_message(RpcStatusCode::UNIMPLEMENTED, msg.to_owned());
         let f = sink
             .fail(rs)
             .map_err(|e| error!("failed to send response, the error is: {:?}", e))
@@ -626,12 +774,9 @@ impl Lease for MockEtcd {
         _req: LeaseTimeToLiveRequest,
         sink: UnarySink<LeaseTimeToLiveResponse>,
     ) {
-        fail(
-            &ctx,
-            sink,
-            RpcStatusCode::UNIMPLEMENTED,
-            "Not Implemented".to_owned(),
-        );
+        let msg = "Lease Time To Live Not Implemented";
+        log::debug!("{msg}");
+        fail(&ctx, sink, RpcStatusCode::UNIMPLEMENTED, msg.to_owned());
     }
 }
 
@@ -640,9 +785,10 @@ impl Lease for MockEtcd {
 #[allow(clippy::too_many_lines)]
 mod test {
     use crate::mock_etcd::{MockEtcd, MockEtcdServer};
+    use async_lock::Mutex;
     use etcd_client::{
         Client, ClientConfig, EtcdDeleteRequest, EtcdLeaseGrantRequest, EtcdLockRequest,
-        EtcdPutRequest, EtcdRangeRequest, EtcdUnlockRequest, KeyRange,
+        EtcdPutRequest, EtcdRangeRequest, EtcdUnlockRequest, KeyRange, TxnCmp,
     };
 
     use std::{env::set_var, sync::Arc};
@@ -665,6 +811,7 @@ mod test {
         e2e_test(&client.clone());
         e2e_watch_test(&client.clone());
         e2e_lock_lease_test(&client.clone());
+        e2e_txn_test(&client.clone());
         smol::future::block_on(async {
             client
                 .shutdown()
@@ -702,18 +849,18 @@ mod test {
             put110.set_value(vec![1_u8, 1_u8, 0_u8]);
             put111.set_value(vec![1_u8, 1_u8, 1_u8]);
 
-            assert_eq!(inner.map_insert(put000.clone()).await, None);
+            assert_eq!(inner.map_insert(&put000).await, None);
 
-            assert_eq!(inner.map_insert(put001.clone()).await, None);
-            assert_eq!(inner.map_insert(put010.clone()).await, None);
-            assert_eq!(inner.map_insert(put011.clone()).await, None);
-            assert_eq!(inner.map_insert(put100.clone()).await, None);
-            assert_eq!(inner.map_insert(put101.clone()).await, None);
-            assert_eq!(inner.map_insert(put110.clone()).await, None);
-            assert_eq!(inner.map_insert(put111.clone()).await, None);
+            assert_eq!(inner.map_insert(&put001).await, None);
+            assert_eq!(inner.map_insert(&put010).await, None);
+            assert_eq!(inner.map_insert(&put011).await, None);
+            assert_eq!(inner.map_insert(&put100).await, None);
+            assert_eq!(inner.map_insert(&put101).await, None);
+            assert_eq!(inner.map_insert(&put110).await, None);
+            assert_eq!(inner.map_insert(&put111).await, None);
             assert_eq!(
                 {
-                    let kv = inner.map_insert(put000.clone()).await;
+                    let kv = inner.map_insert(&put000).await;
                     kv.unwrap().get_value().to_owned()
                 },
                 vec![0_u8, 0_u8, 0_u8]
@@ -741,17 +888,17 @@ mod test {
             range2.set_key(vec![0_u8, 1_u8, 1_u8]);
             range2.set_range_end(vec![1_u8, 1_u8, 1_u8]);
 
-            assert_eq!(inner.map_get(&one_key_1), vec![]);
+            assert_eq!(inner.map_get_by_request(&one_key_1), vec![]);
             assert_eq!(
                 {
-                    let kv = inner.map_get(&one_key_2);
+                    let kv = inner.map_get_by_request(&one_key_2);
                     kv.get(0).unwrap().get_value().to_owned()
                 },
                 vec![0_u8, 0_u8, 0_u8]
             );
-            assert_eq!(inner.map_get(&all_keys).len(), 8);
-            assert_eq!(inner.map_get(&range1).len(), 2);
-            assert_eq!(inner.map_get(&range2).len(), 4);
+            assert_eq!(inner.map_get_by_request(&all_keys).len(), 8);
+            assert_eq!(inner.map_get_by_request(&range1).len(), 2);
+            assert_eq!(inner.map_get_by_request(&range2).len(), 4);
 
             // Test delete
             let mut delete_no_exist = crate::rpc::DeleteRangeRequest::new();
@@ -770,30 +917,31 @@ mod test {
             delete_all.set_key(vec![0_u8]);
             delete_all.set_range_end(vec![0_u8]);
 
-            assert_eq!(inner.map_delete(delete_no_exist.clone()).await.len(), 0);
+            assert_eq!(inner.map_delete(&delete_no_exist).await.len(), 0);
             assert_eq!(
                 {
-                    let kv = inner.map_delete(delete_one_key.clone()).await;
+                    let kv = inner.map_delete(&delete_one_key).await;
                     kv.get(0).unwrap().get_value().to_owned()
                 },
                 vec![1_u8, 1_u8, 1_u8]
             );
             assert_eq!(inner.map.len(), 7);
-            assert_eq!(inner.map_delete(delete_range.clone()).await.len(), 2);
+            assert_eq!(inner.map_delete(&delete_range).await.len(), 2);
             assert_eq!(inner.map.len(), 5);
-            assert_eq!(inner.map_delete(delete_all.clone()).await.len(), 5);
+            assert_eq!(inner.map_delete(&delete_all.clone()).await.len(), 5);
             assert_eq!(inner.map.len(), 0);
             // test kv revision
-            inner.map_insert(put000.clone()).await;
-            let prev_val1 = inner.map_insert(put000.clone()).await;
+            inner.map_insert(&put000).await;
+            let prev_val1 = inner.map_insert(&put000).await;
             let revision1 = prev_val1.unwrap().get_mod_revision();
-            let prev_val2 = inner.map_insert(put000.clone()).await;
+            let prev_val2 = inner.map_insert(&put000).await;
             let revision2 = prev_val2.unwrap().get_mod_revision();
             assert_eq!(revision1 + 1, revision2);
         });
     }
 
     fn e2e_test(client: &Arc<Client>) {
+        log::debug!("start e2e test");
         smol::future::block_on(async {
             let key000 = vec![0_u8, 0_u8, 0_u8];
             let key001 = vec![0_u8, 0_u8, 1_u8];
@@ -944,7 +1092,9 @@ mod test {
         });
     }
 
+    #[allow(dead_code)]
     fn e2e_watch_test(client: &Arc<Client>) {
+        log::debug!("start e2e_watch_test");
         smol::future::block_on(async {
             let key000 = vec![0_u8, 0_u8, 0_u8];
             let key001 = vec![0_u8, 0_u8, 1_u8];
@@ -1008,6 +1158,7 @@ mod test {
     }
 
     fn e2e_lock_lease_test(client: &Arc<Client>) {
+        log::debug!("start e2e_lock_lease_test");
         smol::future::block_on(async {
             let lock_key012 = vec![0_u8, 1_u8, 2_u8];
 
@@ -1042,6 +1193,53 @@ mod test {
                 .await
                 .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
             assert_eq!(res.id(), 1);
+        });
+    }
+
+    fn e2e_txn_test(client: &Arc<Client>) {
+        log::debug!("start e2e_txn_test");
+        smol::future::block_on(async {
+            let succ_put_value = Arc::new(Mutex::new("".to_owned()));
+            let mut tasks = vec![];
+            for txn_task_i in 0..5 {
+                let client = client.clone();
+                let succ_put_value = succ_put_value.clone();
+                tasks.push(smol::spawn(async move {
+                    let key = "txn_key";
+                    let value = format!("txn_value{txn_task_i}");
+                    let put_request = etcd_client::EtcdPutRequest::new(key.clone(), &*value);
+                    let txn_req = etcd_client::EtcdTxnRequest::new()
+                        .when_create_revision(
+                            etcd_client::KeyRange::key(key.clone()),
+                            TxnCmp::Equal,
+                            0,
+                        )
+                        //key does not exist, insert kv
+                        .and_then(put_request)
+                        //key exists, return old value
+                        .or_else(etcd_client::EtcdRangeRequest::new(
+                            etcd_client::KeyRange::key(key.clone()),
+                        ));
+                    let txn_res = client.kv().txn(txn_req).await.unwrap();
+                    if txn_res.is_success() {
+                        let mut succ_put_value = succ_put_value.lock().await;
+                        *succ_put_value = value.clone();
+                    } else {
+                        let mut txn_res = txn_res.get_responses();
+                        assert_eq!(txn_res.len(), 1, "txn response length is not 1");
+                        let range = match txn_res.pop().unwrap() {
+                            etcd_client::TxnOpResponse::Range(range) => range,
+                            _ => panic!("unexpected txn response"),
+                        };
+                        let kvs = range.get_kvs();
+                        let existed = kvs[0].value_str();
+                        let succ_put_value = succ_put_value.lock().await;
+                        assert_eq!(&*succ_put_value, existed);
+                    }
+                }));
+            }
+
+            futures::future::join_all(tasks).await;
         });
     }
 }
