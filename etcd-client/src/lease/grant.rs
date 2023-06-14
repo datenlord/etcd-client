@@ -56,6 +56,7 @@ impl EtcdLeaseGrantResponse {
     /// Gets the lease ID for the granted lease.
     #[inline]
     pub fn id(&self) -> u64 {
+        log::debug!("lease id: {}", self.proto.ID);
         self.proto.ID.cast()
     }
 
