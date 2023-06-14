@@ -406,7 +406,7 @@ mod tests {
             .lock(EtcdLockRequest::new(b"ABC".to_vec(), lease_id))
             .await?
             .take_key();
-
+        log::debug!("lock done 1");
         // 2. Wait until the first lock released automatically
         let time1 = SystemTime::now();
         let key_bytes2 = client
@@ -415,7 +415,7 @@ mod tests {
             .await?
             .take_key();
         let time2 = SystemTime::now();
-
+        log::debug!("lock done 2");
         // wait a least 5 seconds (the first lock has a 10s lease)
         assert!(
             time2
@@ -438,7 +438,7 @@ mod tests {
             .lock()
             .unlock(EtcdUnlockRequest::new(key_bytes))
             .await?;
-
+        log::debug!("lock done 3");
         client
             .lock()
             .unlock(EtcdUnlockRequest::new(key_bytes2))
