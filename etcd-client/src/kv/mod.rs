@@ -501,11 +501,9 @@ impl Kv {
         };
         let mut resp: EtcdDeleteResponse = retryable!(|| async {
             let resp = self.client.delete_range_async(&req.clone().into())?;
-            let ret = resp.await?;
-            Ok(From::from(ret))
+            Ok(From::from(resp.await?))
         });
 
-        log::debug!("delete request done");
         // Wait until cache is updated and then return
         if let Some(ref kvcache) = self.kvcache {
             let prev_kv = if request_prev_kv {
@@ -522,7 +520,7 @@ impl Kv {
                 }
             }
         }
-        log::debug!("delete request about to return");
+
         Ok(resp)
     }
 

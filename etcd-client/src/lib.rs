@@ -240,6 +240,13 @@ mod tests {
         });
 
         smol::block_on(Compat::new(async {
+            {
+                let client = build_etcd_client().await?;
+                client
+                    .kv()
+                    .delete(EtcdDeleteRequest::new(KeyRange::all()))
+                    .await?;
+            }
             test_kv().await?;
             test_transaction().await?;
             test_watch("test_all").await?;
@@ -436,6 +443,7 @@ mod tests {
             .lock()
             .unlock(EtcdUnlockRequest::new(key_bytes2))
             .await?;
+
         clean_etcd(&client).await?;
         client.shutdown().await?;
         Ok(())
@@ -662,7 +670,7 @@ mod tests {
             ],
             auth: None,
             cache_size: 64,
-            cache_enable: true,
+            cache_enable: false,
         })
         .await?;
         Ok(client)

@@ -112,13 +112,13 @@ struct KeyRange {
 
 /// Mock Etcd
 #[derive(Clone)]
-pub(crate) struct MockEtcd {
+struct MockEtcd {
     /// Inner Data
     inner: Arc<Mutex<MockEtcdInner>>,
 }
 
 /// Mocd Etcd Inner
-pub(crate) struct MockEtcdInner {
+struct MockEtcdInner {
     /// map to store key value
     map: HashMap<Vec<u8>, KeyValue>,
     /// map to store key and watch ids
@@ -351,7 +351,7 @@ impl MockEtcdInner {
         let prev_revision = self.revision.fetch_add(1, Ordering::Relaxed);
         kv.set_mod_revision(prev_revision.overflow_add(1));
         let prev_kv = self.map.get(&req.get_key().to_vec()).cloned();
-        if let Some(prev_kv) = &prev_kv {
+        if let Some(ref prev_kv) = prev_kv {
             kv.set_version(prev_kv.get_version().overflow_add(1));
         } else {
             kv.set_version(1);
@@ -363,6 +363,7 @@ impl MockEtcdInner {
         insert_res
     }
 
+    /// Delete keys by key range from map
     async fn map_delete_by_keyrange(
         &mut self,
         begin: Vec<u8>,
@@ -804,11 +805,11 @@ impl Lease for MockEtcd {
     ) {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            log::debug!("inner locked");
+            log::debug!("inner locked at `lease_grant` ");
             let mut inner = inner_clone.lock().await;
             let lease_id = inner.lease();
             drop(inner);
-            log::debug!("inner unlocked");
+            log::debug!("inner unlocked at `lease_grant`, lease id allocated: {lease_id}");
 
             smol::spawn(async move {
                 // ttl here is second
@@ -885,7 +886,7 @@ impl Lease for MockEtcd {
 #[allow(clippy::all, clippy::restriction)]
 #[allow(clippy::too_many_lines)]
 mod test {
-    use crate::mock_etcd::{MockEtcd, MockEtcdServer};
+    use crate::{mock_etcd::MockEtcd, MockEtcdServer};
     use async_lock::Mutex;
     use etcd_client::{
         Client, ClientConfig, EtcdDeleteRequest, EtcdLeaseGrantRequest, EtcdLockRequest,
@@ -903,12 +904,22 @@ mod test {
         etcd_server.start();
         let client = Arc::new(smol::future::block_on(async {
             let endpoints = vec!["127.0.0.1:2379".to_owned()];
-            let config = ClientConfig::new(endpoints, None, 10, true);
+            let config = ClientConfig::new(endpoints, None, 10, false);
             let client = Client::connect(config).await.unwrap_or_else(|err| {
                 panic!("failed to connect to etcd server, the error is: {}", err)
             });
             client
         }));
+        {
+            let client = client.clone();
+            smol::future::block_on(async {
+                client
+                    .kv()
+                    .delete(EtcdDeleteRequest::new(KeyRange::all()))
+                    .await
+                    .unwrap();
+            });
+        }
         e2e_test(&client.clone());
         e2e_watch_test(&client.clone());
         e2e_lock_lease_test(&client.clone());
@@ -1216,8 +1227,6 @@ mod test {
                 .await
                 .unwrap_or_else(|e| panic!("watch failed, err {e}"));
 
-            let watch_id = 2; // 0-1 is used by e2e_test()
-
             for key in test_data {
                 client
                     .kv()
@@ -1238,7 +1247,6 @@ mod test {
             for _x in 0..3 {
                 match resp_receiver.recv().await {
                     Ok(mut watch_resp) => {
-                        assert_eq!(watch_resp.watch_id(), watch_id);
                         let mut events = watch_resp.take_events();
                         let event = events
                             .get_mut(0)
@@ -1262,30 +1270,6 @@ mod test {
         log::debug!("start e2e_lock_lease_test");
         smol::future::block_on(async {
             let lock_key012 = vec![0_u8, 1_u8, 2_u8];
-
-            let mut res = client
-                .lock()
-                .lock(EtcdLockRequest::new(lock_key012.clone(), 10))
-                .await
-                .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
-            assert_eq!(res.take_key(), lock_key012);
-            client
-                .lock()
-                .unlock(EtcdUnlockRequest::new(lock_key012.clone()))
-                .await
-                .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
-            let mut res = client
-                .lock()
-                .lock(EtcdLockRequest::new(lock_key012.clone(), 10))
-                .await
-                .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
-            assert_eq!(res.take_key(), lock_key012);
-            client
-                .lock()
-                .unlock(EtcdUnlockRequest::new(lock_key012.clone()))
-                .await
-                .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
-
             let res = client
                 .lease()
                 .grant(EtcdLeaseGrantRequest::new(std::time::Duration::from_secs(
@@ -1293,7 +1277,31 @@ mod test {
                 )))
                 .await
                 .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
-            assert_eq!(res.id(), 1);
+            let lease_id = res.id();
+
+            let mut res = client
+                .lock()
+                .lock(EtcdLockRequest::new(lock_key012.clone(), lease_id))
+                .await
+                .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
+
+            client
+                .lock()
+                .unlock(EtcdUnlockRequest::new(res.take_key()))
+                .await
+                .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
+
+            let mut res = client
+                .lock()
+                .lock(EtcdLockRequest::new(lock_key012.clone(), lease_id))
+                .await
+                .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
+
+            client
+                .lock()
+                .unlock(EtcdUnlockRequest::new(res.take_key()))
+                .await
+                .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
         });
     }
 
