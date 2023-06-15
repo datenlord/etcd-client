@@ -501,8 +501,7 @@ impl Kv {
         };
         let mut resp: EtcdDeleteResponse = retryable!(|| async {
             let resp = self.client.delete_range_async(&req.clone().into())?;
-            let ret = resp.await?;
-            Ok(From::from(ret))
+            Ok(From::from(resp.await?))
         });
 
         // Wait until cache is updated and then return
