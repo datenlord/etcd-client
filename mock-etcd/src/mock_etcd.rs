@@ -225,6 +225,7 @@ impl MockEtcdInner {
     }
 
     /// Send watch response for a specific watch id to etcd client
+    /// - return true if send success
     async fn send_watch_response_with_watch_id(
         &self,
         sender: LockedDuplexSink,
