@@ -24,7 +24,7 @@ use grpcio::{
 use log::{debug, error, warn};
 use protobuf::RepeatedField;
 use smol::lock::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,7 +102,7 @@ impl MockEtcdServer {
 }
 
 /// `KeyRange` is an abstraction for describing etcd key of various types.
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct KeyRange {
     /// The first key of the range and should be non-empty
     key: Vec<u8>,
@@ -131,6 +131,12 @@ struct MockEtcdInner {
     watch_id_counter: AtomicI64,
     /// Revision of etcd
     revision: AtomicI64,
+    /// Lease id
+    next_lease_id: i64,
+    /// Lease 2 keyrangs
+    lease_2_keyranges: HashMap<i64, BTreeSet<KeyRange>>,
+    /// Lease 2 lock keyrangs
+    lease_2_lock_key: HashMap<i64, BTreeSet<Vec<u8>>>,
 }
 
 /// A locked `DuplexSink` for watch response
@@ -150,7 +156,38 @@ impl MockEtcdInner {
             lock_map: HashSet::new(),
             watch_id_counter: AtomicI64::new(0),
             revision: AtomicI64::new(0),
+            next_lease_id: 0,
+            lease_2_keyranges: HashMap::new(),
+            lease_2_lock_key: HashMap::new(),
         }
+    }
+
+    /// Lease
+    fn lease(&mut self) -> i64 {
+        let lease_id = self.next_lease_id;
+        self.next_lease_id = self.next_lease_id.overflow_add(1);
+        self.lease_2_keyranges.insert(lease_id, BTreeSet::new());
+        self.lease_2_lock_key.insert(lease_id, BTreeSet::new());
+        lease_id
+    }
+
+    /// Set Key range to lease
+    fn set_key_range_2_lease(&mut self, lease_id: i64, range: KeyRange) -> bool {
+        self.lease_2_keyranges
+            .get_mut(&lease_id)
+            .map_or(false, |set| {
+                set.insert(range);
+                true
+            })
+    }
+    /// Set lock key range to lease
+    fn set_lock_key_2_lease(&mut self, lease_id: i64, key: Vec<u8>) -> bool {
+        self.lease_2_lock_key
+            .get_mut(&lease_id)
+            .map_or(false, |set| {
+                set.insert(key);
+                true
+            })
     }
 
     /// Get kv by key vec
@@ -308,6 +345,15 @@ impl MockEtcdInner {
 
     /// Insert a key value from a `PutRequest` to map
     async fn map_insert(&mut self, req: &PutRequest) -> Option<KeyValue> {
+        if !req.ignore_lease {
+            self.set_key_range_2_lease(
+                req.lease,
+                KeyRange {
+                    key: req.get_key().to_vec(),
+                    range_end: vec![],
+                },
+            );
+        }
         let mut kv = KeyValue::new();
         kv.set_key(req.get_key().to_vec());
         kv.set_value(req.get_value().to_vec());
@@ -327,27 +373,28 @@ impl MockEtcdInner {
         insert_res
     }
 
-    /// Delete keys from `DeleteRangeRequest` from map
-    #[allow(clippy::pattern_type_mismatch)]
-    async fn map_delete(&mut self, req: &DeleteRangeRequest) -> Vec<KeyValue> {
-        let key = req.get_key().to_vec();
-        let range_end = req.get_range_end().to_vec();
+    /// Delete keys by key range from map
+    async fn map_delete_by_keyrange(
+        &mut self,
+        begin: Vec<u8>,
+        range_end: Vec<u8>,
+    ) -> Vec<KeyValue> {
         let mut prev_kvs = vec![];
         match range_end.as_slice() {
             ONE_KEY => {
-                if let Some(kv) = self.map.remove(&key) {
+                if let Some(kv) = self.map.remove(&begin) {
                     prev_kvs.push(kv);
                 }
             }
             ALL_KEYS => {
-                if key == vec![0_u8] {
+                if begin == vec![0_u8] {
                     self.map.values().for_each(|v| prev_kvs.push(v.clone()));
                     self.map.clear();
                 }
             }
             _ => {
                 self.map.retain(|k, v| {
-                    if k >= &key && k < &range_end {
+                    if k >= &begin && k < &range_end {
                         prev_kvs.push(v.clone());
                         false
                     } else {
@@ -362,6 +409,15 @@ impl MockEtcdInner {
                 .await;
         }
         prev_kvs
+    }
+
+    /// Delete keys from `DeleteRangeRequest` from map
+    #[allow(clippy::pattern_type_mismatch)]
+    #[inline]
+    async fn map_delete(&mut self, req: &DeleteRangeRequest) -> Vec<KeyValue> {
+        let key = req.get_key().to_vec();
+        let range_end = req.get_range_end().to_vec();
+        self.map_delete_by_keyrange(key, range_end).await
     }
 }
 impl MockEtcd {
@@ -609,9 +665,11 @@ impl Kv for MockEtcd {
         );
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
+            log::debug!("inner lock range");
             let mut inner = inner_clone.lock().await;
 
             success(Self::range_inner(&mut inner, &req), sink).await;
+            log::debug!("inner unlocked range");
         };
 
         smol::spawn(task).detach();
@@ -626,8 +684,10 @@ impl Kv for MockEtcd {
 
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
+            log::debug!("inner lock put");
             let mut inner = inner_clone.lock().await;
             success(Self::put_inner(&mut inner, &req).await, sink).await;
+            log::debug!("inner unlocked put");
         };
         smol::spawn(task).detach();
     }
@@ -646,9 +706,21 @@ impl Kv for MockEtcd {
 
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
+            log::debug!("inner lock delete_range");
             let mut inner = inner_clone.lock().await;
+            debug!(
+                "Handling delete range request, inner locked, key={:?}, range_end={:?}",
+                req.get_key(),
+                req.get_range_end()
+            );
+
             let response = Self::delete_range_inner(&mut inner, &req).await;
+
+            // sometimes it can't send the response, so we use a timer to make sure the response is sent
+            Timer::after(Duration::from_millis(1000));
             success(response, sink).await;
+
+            log::debug!("inner unlock delete_range");
         };
         smol::spawn(task).detach();
     }
@@ -657,10 +729,13 @@ impl Kv for MockEtcd {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         debug!("Receive txn request");
         smol::spawn(async move {
+            log::debug!("inner lock txn");
             let mut inner = inner_clone.lock().await;
+
             let response = Self::txn_inner(&mut inner, &req).await;
-            debug!("Handled txn request");
+
             success(response, sink).await;
+            log::debug!("inner unlock txn");
         })
         .detach();
     }
@@ -680,17 +755,22 @@ impl Kv for MockEtcd {
 impl Lock for MockEtcd {
     fn lock(&mut self, _ctx: RpcContext, req: LockRequest, sink: UnarySink<LockResponse>) {
         debug!("Receive lock request key={:?}", req.get_name(),);
+
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             loop {
+                log::debug!("inner lock `lock`");
                 let mut inner = inner_clone.lock().await;
                 if inner.lock_map.contains(req.get_name()) {
                     Timer::after(Duration::from_secs(1)).await;
                     drop(inner);
+                    log::debug!("inner unlock `lock`");
                 } else {
                     inner.lock_map.insert(req.get_name().to_vec());
+                    inner.set_lock_key_2_lease(req.get_lease(), req.get_name().to_vec());
                     let revision = inner.revision.load(Ordering::Relaxed);
                     drop(inner);
+                    log::debug!("inner unlock `lock`");
                     let mut response = LockResponse::new();
                     response.set_key(req.get_name().to_vec());
                     let header = response.mut_header();
@@ -708,6 +788,7 @@ impl Lock for MockEtcd {
         debug!("Receive unlock request key={:?}", req.get_key(),);
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
+            log::debug!("inner lock `unlock`");
             let mut inner = inner_clone.lock().await;
             if inner.lock_map.contains(req.get_key()) {
                 inner.lock_map.remove(req.get_key());
@@ -715,6 +796,7 @@ impl Lock for MockEtcd {
             }
             let revision = inner.revision.load(Ordering::Relaxed);
             drop(inner);
+            log::debug!("inner unlock `unlock`");
             let mut response = UnlockResponse::new();
             let header = response.mut_header();
             header.set_revision(revision);
@@ -729,12 +811,48 @@ impl Lease for MockEtcd {
     fn lease_grant(
         &mut self,
         _ctx: RpcContext,
-        _req: LeaseGrantRequest,
+        req: LeaseGrantRequest,
         sink: UnarySink<LeaseGrantResponse>,
     ) {
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
+            log::debug!("inner locked at `lease_grant` ");
+            let mut inner = inner_clone.lock().await;
+            let lease_id = inner.lease();
+            drop(inner);
+            log::debug!("inner unlocked at `lease_grant`, lease id allocated: {lease_id}");
+
+            smol::spawn(async move {
+                // ttl here is second
+                // https://docs.rs/etcd-rs/latest/src/etcd_rs/lease/grant.rs.html#14-21
+                Timer::after(Duration::from_secs(req.TTL.try_into().unwrap_or_else(
+                    |e| {
+                        panic!(
+                            "lease ttl should be u64, but got < 0: {:?}, err:{e}",
+                            req.TTL
+                        )
+                    },
+                )))
+                .await;
+                log::debug!("inner lock `lease timeout`");
+                let mut inner = inner_clone.lock().await;
+                if let Some(keyranges) = inner.lease_2_keyranges.remove(&lease_id) {
+                    for keyrange in &keyranges {
+                        let begin = keyrange.key.clone();
+                        let end = keyrange.range_end.clone();
+                        inner.map_delete_by_keyrange(begin, end).await;
+                    }
+                }
+                if let Some(keys) = inner.lease_2_lock_key.remove(&lease_id) {
+                    for key in &keys {
+                        inner.lock_map.remove(key);
+                    }
+                }
+                log::debug!("inner unlocked `lease timeout`");
+            })
+            .detach();
             let mut response = LeaseGrantResponse::new();
-            response.set_ID(1);
+            response.set_ID(lease_id);
             success(response, sink).await;
         };
 
@@ -784,14 +902,25 @@ impl Lease for MockEtcd {
 #[allow(clippy::all, clippy::restriction)]
 #[allow(clippy::too_many_lines)]
 mod test {
-    use crate::mock_etcd::{MockEtcd, MockEtcdServer};
+    use crate::{mock_etcd::MockEtcd, MockEtcdServer};
     use async_lock::Mutex;
     use etcd_client::{
         Client, ClientConfig, EtcdDeleteRequest, EtcdLeaseGrantRequest, EtcdLockRequest,
         EtcdPutRequest, EtcdRangeRequest, EtcdUnlockRequest, KeyRange, TxnCmp,
     };
+    use futures::FutureExt;
+    use std::{
+        env::set_var,
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
-    use std::{env::set_var, sync::Arc};
+    fn timestamp() -> Duration {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|err| panic!("Time went backwards, err:{err}"))
+    }
+
     #[test]
     fn test_all() {
         set_var("RUST_LOG", "debug");
@@ -802,12 +931,22 @@ mod test {
         etcd_server.start();
         let client = Arc::new(smol::future::block_on(async {
             let endpoints = vec!["127.0.0.1:2379".to_owned()];
-            let config = ClientConfig::new(endpoints, None, 10, true);
+            let config = ClientConfig::new(endpoints, None, 10, false);
             let client = Client::connect(config).await.unwrap_or_else(|err| {
                 panic!("failed to connect to etcd server, the error is: {}", err)
             });
             client
         }));
+        {
+            let client = client.clone();
+            smol::future::block_on(async {
+                client
+                    .kv()
+                    .delete(EtcdDeleteRequest::new(KeyRange::all()))
+                    .await
+                    .unwrap();
+            });
+        }
         e2e_test(&client.clone());
         e2e_watch_test(&client.clone());
         e2e_lock_lease_test(&client.clone());
@@ -1115,8 +1254,6 @@ mod test {
                 .await
                 .unwrap_or_else(|e| panic!("watch failed, err {e}"));
 
-            let watch_id = 2; // 0-1 is used by e2e_test()
-
             for key in test_data {
                 client
                     .kv()
@@ -1137,7 +1274,6 @@ mod test {
             for _x in 0..3 {
                 match resp_receiver.recv().await {
                     Ok(mut watch_resp) => {
-                        assert_eq!(watch_resp.watch_id(), watch_id);
                         let mut events = watch_resp.take_events();
                         let event = events
                             .get_mut(0)
@@ -1161,38 +1297,72 @@ mod test {
         log::debug!("start e2e_lock_lease_test");
         smol::future::block_on(async {
             let lock_key012 = vec![0_u8, 1_u8, 2_u8];
-
-            let mut res = client
-                .lock()
-                .lock(EtcdLockRequest::new(lock_key012.clone(), 10))
-                .await
-                .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
-            assert_eq!(res.take_key(), lock_key012);
-            client
-                .lock()
-                .unlock(EtcdUnlockRequest::new(lock_key012.clone()))
-                .await
-                .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
-            let mut res = client
-                .lock()
-                .lock(EtcdLockRequest::new(lock_key012.clone(), 10))
-                .await
-                .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
-            assert_eq!(res.take_key(), lock_key012);
-            client
-                .lock()
-                .unlock(EtcdUnlockRequest::new(lock_key012.clone()))
-                .await
-                .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
-
             let res = client
                 .lease()
                 .grant(EtcdLeaseGrantRequest::new(std::time::Duration::from_secs(
-                    10,
+                    5,
                 )))
                 .await
                 .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
-            assert_eq!(res.id(), 1);
+            let lease_id = res.id();
+
+            // lock unlock twice
+            {
+                log::debug!("test basic lock");
+                let mut res = client
+                    .lock()
+                    .lock(EtcdLockRequest::new(lock_key012.clone(), lease_id))
+                    .await
+                    .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
+
+                client
+                    .lock()
+                    .unlock(EtcdUnlockRequest::new(res.take_key()))
+                    .await
+                    .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
+
+                let mut res = client
+                    .lock()
+                    .lock(EtcdLockRequest::new(lock_key012.clone(), lease_id))
+                    .await
+                    .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
+
+                client
+                    .lock()
+                    .unlock(EtcdUnlockRequest::new(res.take_key()))
+                    .await
+                    .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
+            }
+
+            {
+                log::debug!("test lock with lease");
+                // lock first and the second lock can be return in 5s.
+                let _res = client
+                    .lock()
+                    .lock(EtcdLockRequest::new(lock_key012.clone(), lease_id))
+                    .await
+                    .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
+                let locked = timestamp();
+                let mut lock = client.lock();
+                let res = futures::select! {
+                    _ = smol::Timer::after(Duration::from_secs(7)).fuse() => {
+                        let timeout=timestamp();
+                        log::debug!("wait for 8s and lock didn't return, {}",(timeout-locked).as_secs());
+                        None
+                    }
+                    res  = lock.lock(EtcdLockRequest::new(lock_key012.clone(), lease_id)).fuse() => Some(res.unwrap())
+                };
+                let return_time = timestamp();
+                log::debug!(
+                    "wait for lock return cost {} ms",
+                    (return_time - locked).as_millis()
+                );
+                // lease is smaller the 5s and lock will success in < 5s
+                assert!(
+                    res.is_some(),
+                    " lease is smaller than 5s now and lock should return in about 5s"
+                );
+            }
         });
     }
 

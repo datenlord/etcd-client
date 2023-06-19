@@ -503,6 +503,7 @@ impl Kv {
             let resp = self.client.delete_range_async(&req.clone().into())?;
             Ok(From::from(resp.await?))
         });
+
         // Wait until cache is updated and then return
         if let Some(ref kvcache) = self.kvcache {
             let prev_kv = if request_prev_kv {
@@ -519,6 +520,7 @@ impl Kv {
                 }
             }
         }
+
         Ok(resp)
     }
 
