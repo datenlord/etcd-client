@@ -25,7 +25,6 @@ use log::{debug, error, warn};
 use protobuf::RepeatedField;
 use smol::lock::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -233,7 +232,7 @@ impl MockEtcdInner {
         prev_kv: Option<KeyValue>,
         watch_id: i64,
         event_type: Event_EventType,
-    ) {
+    ) -> Result<(), grpcio::Error> {
         let mut event = Event::new();
         event.set_field_type(event_type);
         if let Some(value) = prev_kv {
@@ -252,17 +251,17 @@ impl MockEtcdInner {
             .await
             .send((response, WriteFlags::default()))
             .await
-            .unwrap_or_else(|e| panic!("Fail to send watch response, the error is {}", e));
     }
 
     /// Send watch response to etcd client
     #[allow(clippy::pattern_type_mismatch)]
     async fn send_watch_responses(
-        &self,
+        &mut self,
         kv: KeyValue,
         prev_kv: Option<KeyValue>,
         event_type: Event_EventType,
     ) {
+        let mut invalids: Vec<i64> = vec![];
         // Find all watch ids which watch this key and send watch response
         for (watch_id, v) in &self.watch {
             let sender = self
@@ -271,42 +270,59 @@ impl MockEtcdInner {
                 .unwrap_or_else(|| panic!("Fail to get watch response sender from map"));
             match v.range_end.as_slice() {
                 ONE_KEY => {
-                    if v.key == kv.get_key() {
-                        self.send_watch_response_with_watch_id(
-                            Arc::clone(sender),
-                            kv.clone(),
-                            prev_kv.clone(),
-                            *watch_id,
-                            event_type,
-                        )
-                        .await;
+                    if v.key == kv.get_key()
+                        && self
+                            .send_watch_response_with_watch_id(
+                                Arc::clone(sender),
+                                kv.clone(),
+                                prev_kv.clone(),
+                                *watch_id,
+                                event_type,
+                            )
+                            .await
+                            .is_err()
+                    {
+                        invalids.push(*watch_id);
                     }
                 }
                 ALL_KEYS => {
-                    if v.key == vec![0_u8] {
-                        self.send_watch_response_with_watch_id(
-                            Arc::clone(sender),
-                            kv.clone(),
-                            prev_kv.clone(),
-                            *watch_id,
-                            event_type,
-                        )
-                        .await;
+                    if v.key == vec![0_u8]
+                        && self
+                            .send_watch_response_with_watch_id(
+                                Arc::clone(sender),
+                                kv.clone(),
+                                prev_kv.clone(),
+                                *watch_id,
+                                event_type,
+                            )
+                            .await
+                            .is_err()
+                    {
+                        invalids.push(*watch_id);
                     }
                 }
                 _ => {
-                    if kv.get_key().to_vec() >= v.key && kv.get_key().to_vec() < v.range_end {
-                        self.send_watch_response_with_watch_id(
-                            Arc::clone(sender),
-                            kv.clone(),
-                            prev_kv.clone(),
-                            *watch_id,
-                            event_type,
-                        )
-                        .await;
+                    if kv.get_key().to_vec() >= v.key
+                        && kv.get_key().to_vec() < v.range_end
+                        && self
+                            .send_watch_response_with_watch_id(
+                                Arc::clone(sender),
+                                kv.clone(),
+                                prev_kv.clone(),
+                                *watch_id,
+                                event_type,
+                            )
+                            .await
+                            .is_err()
+                    {
+                        invalids.push(*watch_id);
                     }
                 }
             }
+        }
+        for i in invalids {
+            self.watch.remove(&i);
+            self.watch_response_sender.remove(&i);
         }
     }
 
