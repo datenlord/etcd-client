@@ -137,6 +137,8 @@ struct MockEtcdInner {
     lease_2_keyranges: HashMap<i64, BTreeSet<KeyRange>>,
     /// Lease 2 lock keyrangs
     lease_2_lock_key: HashMap<i64, BTreeSet<Vec<u8>>>,
+    /// Lease - (timeout,need_renew)
+    lease_timeout_need_renew: HashMap<i64, (i64, bool)>,
 }
 
 /// A locked `DuplexSink` for watch response
@@ -159,15 +161,26 @@ impl MockEtcdInner {
             next_lease_id: 0,
             lease_2_keyranges: HashMap::new(),
             lease_2_lock_key: HashMap::new(),
+            lease_timeout_need_renew: HashMap::new(),
         }
     }
 
     /// Lease
-    fn lease(&mut self) -> i64 {
+    fn lease(&mut self, timeout_sec: u64) -> i64 {
         let lease_id = self.next_lease_id;
         self.next_lease_id = self.next_lease_id.overflow_add(1);
         self.lease_2_keyranges.insert(lease_id, BTreeSet::new());
         self.lease_2_lock_key.insert(lease_id, BTreeSet::new());
+        self.lease_timeout_need_renew.insert(
+            lease_id,
+            (
+                timeout_sec
+                    .try_into()
+                    .unwrap_or_else(|e| panic!("timeout should < MAX_I64, err{e}")),
+                false,
+            ),
+        );
+        log::debug!("lease id allocated {}", lease_id);
         lease_id
     }
 
@@ -683,8 +696,8 @@ impl Kv for MockEtcd {
         );
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            log::debug!("inner lock range");
             let mut inner = inner_clone.lock().await;
+            log::debug!("inner lock range");
 
             success(Self::range_inner(&mut inner, &req), sink).await;
             log::debug!("inner unlocked range");
@@ -702,8 +715,9 @@ impl Kv for MockEtcd {
 
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            log::debug!("inner lock put");
             let mut inner = inner_clone.lock().await;
+            log::debug!("inner lock put");
+
             success(Self::put_inner(&mut inner, &req).await, sink).await;
             log::debug!("inner unlocked put");
         };
@@ -724,8 +738,9 @@ impl Kv for MockEtcd {
 
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            log::debug!("inner lock delete_range");
             let mut inner = inner_clone.lock().await;
+            log::debug!("inner lock delete_range");
+
             debug!(
                 "Handling delete range request, inner locked, key={:?}, range_end={:?}",
                 req.get_key(),
@@ -747,8 +762,8 @@ impl Kv for MockEtcd {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         debug!("Receive txn request");
         smol::spawn(async move {
-            log::debug!("inner lock txn");
             let mut inner = inner_clone.lock().await;
+            log::debug!("inner lock txn");
 
             let response = Self::txn_inner(&mut inner, &req).await;
 
@@ -777,11 +792,12 @@ impl Lock for MockEtcd {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             loop {
-                log::debug!("inner lock `lock`");
                 let mut inner = inner_clone.lock().await;
+                log::debug!("inner lock `lock`");
+
                 if inner.lock_map.contains(req.get_name()) {
-                    Timer::after(Duration::from_secs(1)).await;
                     drop(inner);
+                    Timer::after(Duration::from_secs(1)).await;
                     log::debug!("inner unlock `lock`");
                 } else {
                     inner.lock_map.insert(req.get_name().to_vec());
@@ -806,8 +822,9 @@ impl Lock for MockEtcd {
         debug!("Receive unlock request key={:?}", req.get_key(),);
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            log::debug!("inner lock `unlock`");
             let mut inner = inner_clone.lock().await;
+            log::debug!("inner lock `unlock`");
+
             if inner.lock_map.contains(req.get_key()) {
                 inner.lock_map.remove(req.get_key());
             } else {
@@ -834,38 +851,65 @@ impl Lease for MockEtcd {
     ) {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
-            log::debug!("inner locked at `lease_grant` ");
             let mut inner = inner_clone.lock().await;
-            let lease_id = inner.lease();
+            log::debug!("inner locked at `lease_grant` ");
+
+            let timeout_sec = req.TTL.try_into().unwrap_or_else(|e| {
+                panic!(
+                    "lease ttl should be u64, but got < 0: {:?}, err:{e}",
+                    req.TTL
+                )
+            });
+            let lease_id = inner.lease(timeout_sec);
             drop(inner);
             log::debug!("inner unlocked at `lease_grant`, lease id allocated: {lease_id}");
 
             smol::spawn(async move {
                 // ttl here is second
                 // https://docs.rs/etcd-rs/latest/src/etcd_rs/lease/grant.rs.html#14-21
-                Timer::after(Duration::from_secs(req.TTL.try_into().unwrap_or_else(
-                    |e| {
-                        panic!(
-                            "lease ttl should be u64, but got < 0: {:?}, err:{e}",
-                            req.TTL
-                        )
-                    },
-                )))
-                .await;
-                log::debug!("inner lock `lease timeout`");
+                {
+                    let mut timecount = timeout_sec;
+                    while timecount > 0 {
+                        Timer::after(Duration::from_secs(1)).await;
+                        timecount = timecount.overflow_sub(1);
+                        let mut inner = inner_clone.lock().await;
+                        let &mut (_, ref mut need_renew) = inner
+                            .lease_timeout_need_renew
+                            .get_mut(&lease_id)
+                            .unwrap_or_else(|| panic!("lease id not found: {lease_id}"));
+                        if *need_renew {
+                            timecount = timeout_sec;
+                            *need_renew = false;
+                        }
+                        log::debug!("lease timeout: {timecount} seconds left");
+                    }
+                }
                 let mut inner = inner_clone.lock().await;
-                if let Some(keyranges) = inner.lease_2_keyranges.remove(&lease_id) {
-                    for keyrange in &keyranges {
-                        let begin = keyrange.key.clone();
-                        let end = keyrange.range_end.clone();
-                        inner.map_delete_by_keyrange(begin, end).await;
-                    }
+                log::debug!("inner lock `lease timeout`, lease id: {lease_id}");
+
+                let keyranges = inner
+                    .lease_2_keyranges
+                    .remove(&lease_id)
+                    .unwrap_or_else(|| panic!("lease id not found: {lease_id}"));
+                for keyrange in &keyranges {
+                    let begin = keyrange.key.clone();
+                    let end = keyrange.range_end.clone();
+                    inner.map_delete_by_keyrange(begin, end).await;
                 }
-                if let Some(keys) = inner.lease_2_lock_key.remove(&lease_id) {
-                    for key in &keys {
-                        inner.lock_map.remove(key);
-                    }
+
+                let keys = inner
+                    .lease_2_lock_key
+                    .remove(&lease_id)
+                    .unwrap_or_else(|| panic!("lease id not found: {lease_id}"));
+                for key in &keys {
+                    inner.lock_map.remove(key);
                 }
+
+                let _ = inner
+                    .lease_timeout_need_renew
+                    .remove(&lease_id)
+                    .unwrap_or_else(|| panic!("lease id not found: {lease_id}"));
+
                 log::debug!("inner unlocked `lease timeout`");
             })
             .detach();
@@ -890,18 +934,48 @@ impl Lease for MockEtcd {
 
     fn lease_keep_alive(
         &mut self,
-        ctx: RpcContext,
-        _req: RequestStream<LeaseKeepAliveRequest>,
-        sink: DuplexSink<LeaseKeepAliveResponse>,
+        _ctx: RpcContext,
+        mut req: RequestStream<LeaseKeepAliveRequest>,
+        mut sink: DuplexSink<LeaseKeepAliveResponse>,
     ) {
-        let msg = "Lease Keep Alive Not Implemented";
-        log::debug!("{msg}");
-        let rs = RpcStatus::with_message(RpcStatusCode::UNIMPLEMENTED, msg.to_owned());
-        let f = sink
-            .fail(rs)
-            .map_err(|e| error!("failed to send response, the error is: {:?}", e))
-            .map(|_| ());
-        ctx.spawn(f);
+        let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
+        let task = async move {
+            while let Some(req) = req.next().await {
+                match req {
+                    Ok(req) => {
+                        let mut inner = inner_clone.lock().await;
+                        if let Some(&mut (ref mut timeout, ref mut need_renew)) =
+                            inner.lease_timeout_need_renew.get_mut(&req.get_ID())
+                        {
+                            let mut response = LeaseKeepAliveResponse::new();
+                            response.set_ID(req.get_ID());
+                            response.set_TTL(*timeout);
+                            *need_renew = true;
+                            if let Err(err) = sink.send((response, WriteFlags::default())).await {
+                                log::warn!("lease keep alive sink send error: {err:?}");
+                                break;
+                            }
+                        } else {
+                            log::warn!(
+                                "lease {} doesn't exist, end lease keep alive stream",
+                                req.get_ID()
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("lease keep alive stream recv error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            if let Err(err) = sink.close().await {
+                log::warn!("lease keep alive stream close sink error: {err:?}");
+            }
+            log::debug!("end lease keep alive stream");
+        };
+
+        smol::spawn(task).detach();
     }
 
     fn lease_time_to_live(
@@ -923,8 +997,8 @@ mod test {
     use crate::{mock_etcd::MockEtcd, MockEtcdServer};
     use async_lock::Mutex;
     use etcd_client::{
-        Client, ClientConfig, EtcdDeleteRequest, EtcdLeaseGrantRequest, EtcdLockRequest,
-        EtcdPutRequest, EtcdRangeRequest, EtcdUnlockRequest, KeyRange, TxnCmp,
+        Client, ClientConfig, EtcdDeleteRequest, EtcdLeaseGrantRequest, EtcdLeaseKeepAliveRequest,
+        EtcdLockRequest, EtcdPutRequest, EtcdRangeRequest, EtcdUnlockRequest, KeyRange, TxnCmp,
     };
     use futures::FutureExt;
     use std::{
@@ -1353,6 +1427,16 @@ mod test {
             }
 
             {
+                // new lease id for new lock
+                let res = client
+                    .lease()
+                    .grant(EtcdLeaseGrantRequest::new(std::time::Duration::from_secs(
+                        5,
+                    )))
+                    .await
+                    .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
+                let lease_id = res.id();
+
                 log::debug!("test lock with lease");
                 // lock first and the second lock can be return in 5s.
                 let _res = client
@@ -1360,6 +1444,17 @@ mod test {
                     .lock(EtcdLockRequest::new(lock_key012.clone(), lease_id))
                     .await
                     .unwrap_or_else(|err| panic!("failed to lock key012, the error is {}", err));
+
+                // new lease id for new lock
+                let res = client
+                    .lease()
+                    .grant(EtcdLeaseGrantRequest::new(std::time::Duration::from_secs(
+                        10,
+                    )))
+                    .await
+                    .unwrap_or_else(|err| panic!("failed to get key 0, the error is {}", err));
+                let lease_id = res.id();
+
                 let locked = timestamp();
                 let mut lock = client.lock();
                 let res = futures::select! {
@@ -1375,11 +1470,35 @@ mod test {
                     "wait for lock return cost {} ms",
                     (return_time - locked).as_millis()
                 );
-                // lease is smaller the 5s and lock will success in < 5s
+                // lease is smaller the 5s now and lock will success in about 5s
                 assert!(
                     res.is_some(),
-                    " lease is smaller than 5s now and lock should return in about 5s"
+                    "lease is smaller than 5s now and lock should return in about 5s"
                 );
+
+                {
+                    for _ in 0..3 {
+                        log::debug!("send keep alive request");
+                        // keep alive the lease
+                        client
+                            .lease()
+                            .keep_alive(EtcdLeaseKeepAliveRequest::new(lease_id))
+                            .await
+                            .unwrap();
+
+                        smol::Timer::after(Duration::from_secs(1)).await;
+                    }
+
+                    let begin_lock = timestamp();
+                    lock.lock(EtcdLockRequest::new(lock_key012.clone(), lease_id))
+                        .await
+                        .unwrap();
+                    let end_lock = timestamp();
+                    assert!(
+                        (end_lock - begin_lock).as_secs() > 4,
+                        "lock should return in about 5s, because we keep alive the lease",
+                    );
+                }
             }
         });
     }
