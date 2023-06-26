@@ -137,9 +137,11 @@ impl LeaseKeepAliveTunnel {
             loop {
                 #[allow(clippy::mut_mut)]
                 let resp = futures::select! {
-                    resp_opt = client_resp_receiver.next().fuse() => resp_opt.unwrap_or_else(
-                        || panic!("Fail to receive client response")
-                    ),
+                    resp_opt = client_resp_receiver.next().fuse() => if let Some(resp)=resp_opt {
+                        resp
+                    } else {
+                        return;
+                    },
                     _ = shutdown_rx => return
                 };
                 match resp {
