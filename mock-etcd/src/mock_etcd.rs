@@ -24,7 +24,7 @@ use grpcio::{
 use log::{debug, error, warn};
 use protobuf::RepeatedField;
 use smol::lock::Mutex;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,8 +135,8 @@ struct MockEtcdInner {
     watch: HashMap<i64, KeyRange>,
     /// map to store watch id and watch response senders
     watch_response_sender: HashMap<i64, LockedDuplexSink>,
-    /// set to store lock name
-    lock_map: HashSet<Vec<u8>>,
+    /// set to store lock name to create_revision
+    lock_map: HashMap<Vec<u8>, i64>,
     /// Sequence increasing watch id
     watch_id_counter: AtomicI64,
     /// Revision of etcd
@@ -144,9 +144,9 @@ struct MockEtcdInner {
     /// Lease id
     next_lease_id: i64,
     /// Lease 2 keyrangs
-    lease_2_keyranges: HashMap<i64, BTreeSet<KeyRange>>,
+    lease_2_keyranges: HashMap<i64, BTreeMap<KeyRange, i64>>,
     /// Lease 2 lock keyrangs
-    lease_2_lock_key: HashMap<i64, BTreeSet<Vec<u8>>>,
+    lease_2_lock_key: HashMap<i64, BTreeMap<Vec<u8>, i64>>,
     /// Lease - (timeout, need_renew, closed)
     lease_state: HashMap<i64, (i64, bool, bool)>,
 }
@@ -165,7 +165,7 @@ impl MockEtcdInner {
             map: HashMap::new(),
             watch: HashMap::new(),
             watch_response_sender: HashMap::new(),
-            lock_map: HashSet::new(),
+            lock_map: HashMap::new(),
             watch_id_counter: AtomicI64::new(0),
             revision: AtomicI64::new(0),
             next_lease_id: 0,
@@ -179,8 +179,8 @@ impl MockEtcdInner {
     fn lease(&mut self, timeout_sec: u64) -> i64 {
         let lease_id = self.next_lease_id;
         self.next_lease_id = self.next_lease_id.overflow_add(1);
-        self.lease_2_keyranges.insert(lease_id, BTreeSet::new());
-        self.lease_2_lock_key.insert(lease_id, BTreeSet::new());
+        self.lease_2_keyranges.insert(lease_id, BTreeMap::new());
+        self.lease_2_lock_key.insert(lease_id, BTreeMap::new());
         self.lease_state.insert(
             lease_id,
             (
@@ -196,20 +196,20 @@ impl MockEtcdInner {
     }
 
     /// Set Key range to lease
-    fn set_key_range_2_lease(&mut self, lease_id: i64, range: KeyRange) -> bool {
+    fn set_key_range_2_lease(&mut self, lease_id: i64, range: KeyRange, key_revision: i64) -> bool {
         self.lease_2_keyranges
             .get_mut(&lease_id)
             .map_or(false, |set| {
-                set.insert(range);
+                set.insert(range, key_revision);
                 true
             })
     }
     /// Set lock key range to lease
-    fn set_lock_key_2_lease(&mut self, lease_id: i64, key: Vec<u8>) -> bool {
+    fn set_lock_key_2_lease(&mut self, lease_id: i64, key: Vec<u8>, key_revision: i64) -> bool {
         self.lease_2_lock_key
             .get_mut(&lease_id)
             .map_or(false, |set| {
-                set.insert(key);
+                set.insert(key, key_revision);
                 true
             })
     }
@@ -387,20 +387,11 @@ impl MockEtcdInner {
 
     /// Insert a key value from a `PutRequest` to map
     async fn map_insert(&mut self, req: &PutRequest) -> Option<KeyValue> {
-        if !req.ignore_lease {
-            self.set_key_range_2_lease(
-                req.lease,
-                KeyRange {
-                    key: req.get_key().to_vec(),
-                    range_end: vec![],
-                },
-            );
-        }
+        let prev_revision = self.revision.fetch_add(1, Ordering::Relaxed);
         let mut kv = KeyValue::new();
         kv.set_key(req.get_key().to_vec());
         kv.set_value(req.get_value().to_vec());
 
-        let prev_revision = self.revision.fetch_add(1, Ordering::Relaxed);
         kv.set_mod_revision(prev_revision.overflow_add(1));
         let prev_kv = self.map.get(&req.get_key().to_vec()).cloned();
         if let Some(ref prev_kv) = prev_kv {
@@ -409,6 +400,18 @@ impl MockEtcdInner {
             kv.set_version(1);
             kv.set_create_revision(kv.mod_revision);
         }
+
+        if !req.ignore_lease {
+            self.set_key_range_2_lease(
+                req.lease,
+                KeyRange {
+                    key: req.get_key().to_vec(),
+                    range_end: vec![],
+                },
+                kv.create_revision,
+            );
+        }
+
         let insert_res = self.map.insert(req.get_key().to_vec(), kv.clone());
         self.send_watch_responses(kv.clone(), prev_kv, Event_EventType::PUT)
             .await;
@@ -420,25 +423,49 @@ impl MockEtcdInner {
         &mut self,
         begin: Vec<u8>,
         range_end: Vec<u8>,
+        with_revision_check: Option<i64>,
     ) -> Vec<KeyValue> {
         let mut prev_kvs = vec![];
+
+        let mut check_value_retain = |kv: &KeyValue| {
+            if let Some(revision_check) = with_revision_check {
+                if kv.create_revision == revision_check {
+                    prev_kvs.push(kv.clone());
+                    false
+                } else {
+                    true
+                }
+            } else {
+                prev_kvs.push(kv.clone());
+                false
+            }
+        };
+
         match range_end.as_slice() {
             ONE_KEY => {
-                if let Some(kv) = self.map.remove(&begin) {
-                    prev_kvs.push(kv);
+                let remove_able = if let Some(revision_check) = with_revision_check {
+                    self.map
+                        .get(&begin)
+                        .map_or(false, |kv| kv.create_revision == revision_check)
+                } else {
+                    true
+                };
+
+                if remove_able {
+                    if let Some(kv) = self.map.remove(&begin) {
+                        prev_kvs.push(kv);
+                    }
                 }
             }
             ALL_KEYS => {
                 if begin == vec![0_u8] {
-                    self.map.values().for_each(|v| prev_kvs.push(v.clone()));
-                    self.map.clear();
+                    self.map.retain(|_k, v| check_value_retain(v));
                 }
             }
             _ => {
                 self.map.retain(|k, v| {
                     if k >= &begin && k < &range_end {
-                        prev_kvs.push(v.clone());
-                        false
+                        check_value_retain(v)
                     } else {
                         true
                     }
@@ -456,10 +483,15 @@ impl MockEtcdInner {
     /// Delete keys from `DeleteRangeRequest` from map
     #[allow(clippy::pattern_type_mismatch)]
     #[inline]
-    async fn map_delete(&mut self, req: &DeleteRangeRequest) -> Vec<KeyValue> {
+    async fn map_delete(
+        &mut self,
+        req: &DeleteRangeRequest,
+        with_revision_check: Option<i64>,
+    ) -> Vec<KeyValue> {
         let key = req.get_key().to_vec();
         let range_end = req.get_range_end().to_vec();
-        self.map_delete_by_keyrange(key, range_end).await
+        self.map_delete_by_keyrange(key, range_end, with_revision_check)
+            .await
     }
 }
 impl MockEtcd {
@@ -500,7 +532,7 @@ impl MockEtcd {
     ) -> DeleteRangeResponse {
         let mut response = DeleteRangeResponse::new();
         let get_prev = req.get_prev_kv();
-        let prev_kvs = inner.map_delete(req).await;
+        let prev_kvs = inner.map_delete(req, None).await;
         response.set_deleted(prev_kvs.len().cast());
         if get_prev {
             response.set_prev_kvs(RepeatedField::from_vec(prev_kvs));
@@ -792,20 +824,31 @@ impl Lock for MockEtcd {
             loop {
                 let mut inner = inner_clone.lock().await;
 
-                if inner.lock_map.contains(req.get_name()) {
+                if inner.lock_map.get(req.get_name()).is_some() {
                     drop(inner);
                     Timer::after(Duration::from_millis(300)).await;
                 } else {
-                    let revision = inner.revision.load(Ordering::Relaxed);
+                    let prev_revision = inner.revision.fetch_add(1, Ordering::Relaxed);
 
                     let mut response = LockResponse::new();
                     response.set_key(req.get_name().to_vec());
                     let header = response.mut_header();
-                    header.set_revision(revision);
+                    header.set_revision(prev_revision);
                     match sink.success(response).await {
                         Ok(_) => {
-                            inner.lock_map.insert(req.get_name().to_vec());
-                            inner.set_lock_key_2_lease(req.get_lease(), req.get_name().to_vec());
+                            log::debug!(
+                                "lock key:{:?} with lease:{}",
+                                req.get_name(),
+                                req.get_lease()
+                            );
+                            inner
+                                .lock_map
+                                .insert(req.get_name().to_vec(), prev_revision.overflow_add(1));
+                            inner.set_lock_key_2_lease(
+                                req.get_lease(),
+                                req.get_name().to_vec(),
+                                prev_revision.overflow_add(1),
+                            );
                         }
                         Err(e) => {
                             warn!("Fail to send lock response, the error is: {}", e);
@@ -825,12 +868,14 @@ impl Lock for MockEtcd {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             let mut inner = inner_clone.lock().await;
-
-            if inner.lock_map.contains(req.get_key()) {
+            let revision = inner.revision.load(Ordering::Relaxed);
+            if inner.lock_map.get(req.get_key()).is_some() {
+                log::debug!("unlock remove key {:?}", req.get_key());
+                inner.revision.fetch_add(1, Ordering::Relaxed);
                 inner.lock_map.remove(req.get_key());
             } else {
             }
-            let revision = inner.revision.load(Ordering::Relaxed);
+
             drop(inner);
 
             let mut response = UnlockResponse::new();
@@ -853,7 +898,7 @@ impl Lease for MockEtcd {
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
         let task = async move {
             let mut inner = inner_clone.lock().await;
-
+            let prev_revision = inner.revision.fetch_add(1, Ordering::Relaxed);
             let timeout_sec = req.TTL.try_into().unwrap_or_else(|e| {
                 panic!(
                     "lease ttl should be u64, but got < 0: {:?}, err:{e}",
@@ -879,30 +924,42 @@ impl Lease for MockEtcd {
                         if *close {
                             break;
                         } else if *need_renew {
+                            log::debug!("lease {} keep alived", lease_id);
                             timecount = timeout_sec;
                             *need_renew = false;
                         } else {
                         }
                     }
                 }
+                log::debug!("lease timeout {}", lease_id);
                 let mut inner = inner_clone.lock().await;
 
                 let keyranges = inner
                     .lease_2_keyranges
                     .remove(&lease_id)
                     .unwrap_or_else(|| panic!("lease id not found: {lease_id}"));
-                for keyrange in &keyranges {
+                for (keyrange, revision) in &keyranges {
+                    log::debug!("lease timeout {} remove key {:?}", lease_id, keyrange);
                     let begin = keyrange.key.clone();
                     let end = keyrange.range_end.clone();
-                    inner.map_delete_by_keyrange(begin, end).await;
+                    inner
+                        .map_delete_by_keyrange(begin, end, Some(*revision))
+                        .await;
                 }
 
                 let keys = inner
                     .lease_2_lock_key
                     .remove(&lease_id)
                     .unwrap_or_else(|| panic!("lease id not found: {lease_id}"));
-                for key in &keys {
-                    inner.lock_map.remove(key);
+                for (key, revision) in &keys {
+                    log::debug!("lease timeout {} remove lock key {:?}", lease_id, key);
+                    let removeable = inner
+                        .lock_map
+                        .get(key)
+                        .map_or(false, |lock_revision| lock_revision == revision);
+                    if removeable {
+                        inner.lock_map.remove(key);
+                    }
                 }
 
                 let _ = inner
@@ -912,7 +969,8 @@ impl Lease for MockEtcd {
             })
             .detach();
             let mut response = LeaseGrantResponse::new();
-            response.set_ID(lease_id);
+            response.mut_header().revision = prev_revision;
+            response.ID = lease_id;
             success(response, sink, "lease grant success").await;
         };
 
@@ -1163,18 +1221,18 @@ mod test {
             delete_all.set_key(vec![0_u8]);
             delete_all.set_range_end(vec![0_u8]);
 
-            assert_eq!(inner.map_delete(&delete_no_exist).await.len(), 0);
+            assert_eq!(inner.map_delete(&delete_no_exist, None).await.len(), 0);
             assert_eq!(
                 {
-                    let kv = inner.map_delete(&delete_one_key).await;
+                    let kv = inner.map_delete(&delete_one_key, None).await;
                     kv.get(0).unwrap().get_value().to_owned()
                 },
                 vec![1_u8, 1_u8, 1_u8]
             );
             assert_eq!(inner.map.len(), 7);
-            assert_eq!(inner.map_delete(&delete_range).await.len(), 2);
+            assert_eq!(inner.map_delete(&delete_range, None).await.len(), 2);
             assert_eq!(inner.map.len(), 5);
-            assert_eq!(inner.map_delete(&delete_all.clone()).await.len(), 5);
+            assert_eq!(inner.map_delete(&delete_all.clone(), None).await.len(), 5);
             assert_eq!(inner.map.len(), 0);
             // test kv revision
             inner.map_insert(&put000).await;
@@ -1562,7 +1620,7 @@ mod test {
                     );
             }
             async fn test_lease_revoke(client: Client) {
-                async fn lock(client: &Client, lock_key: &str) -> u64 {
+                async fn lock(client: &Client, lock_key: &str) -> (u64, Vec<u8>) {
                     let res = client
                         .lease()
                         .grant(EtcdLeaseGrantRequest::new(std::time::Duration::from_secs(
@@ -1573,20 +1631,27 @@ mod test {
                     let lease_id = res.id();
 
                     // lock first and the second lock can be return in 5s.
-                    let _res = client
+                    let mut res = client
                         .lock()
                         .lock(EtcdLockRequest::new(lock_key, lease_id))
                         .await
                         .unwrap_or_else(|err| {
                             panic!("failed to lock key012, the error is {}", err)
                         });
-                    lease_id
+                    (lease_id, res.take_key())
+                }
+                async fn unlock(client: &Client, lock_token: Vec<u8>) {
+                    client
+                        .lock()
+                        .unlock(EtcdUnlockRequest::new(lock_token))
+                        .await
+                        .unwrap();
                 }
                 log::debug!("test_lease_revoke");
                 let lock_key = "test_lease_revoke";
                 // new lease id for new lock
 
-                let lease_id = lock(&client, lock_key).await;
+                let (lease_id, _lock_token) = lock(&client, lock_key).await;
                 client
                     .lease()
                     .revoke(EtcdLeaseRevokeRequest::new(lease_id))
@@ -1594,9 +1659,29 @@ mod test {
                     .unwrap();
 
                 let lock_start = timestamp();
-                lock(&client, lock_key).await;
+                let (lease_id, lock_token): (u64, Vec<u8>) = lock(&client, lock_key).await;
                 let lock_end = timestamp();
                 assert!((lock_end - lock_start).as_millis() < 2000);
+                unlock(&client, lock_token).await;
+
+                // lock same key with new lease, and revoke old lease, check if the old lease has effect on new lock.
+                let (_, lock_token) = lock(&client, lock_key).await;
+
+                client
+                    .lease()
+                    .revoke(EtcdLeaseRevokeRequest::new(lease_id))
+                    .await
+                    .unwrap();
+
+                // lock should still be held and this lock will timeout.
+
+                futures::select! {
+                    _=smol::Timer::after(Duration::from_secs(1)).fuse()=>{}
+                    _=lock(&client, lock_key).fuse()=>{
+                        panic!("this lock shouldn't be get because the prev lock can't be unlocked by older lease")
+                    }
+                }
+                unlock(&client, lock_token).await;
             }
             let tasks = vec![
                 smol::spawn(test_lock_basic(client.as_ref().clone())),
